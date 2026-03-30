@@ -1,0 +1,12 @@
+.env
+.env.*
+env.keys
+
+# Dependencies
+node_modules/
+
+# Logs and cache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.vercel
