@@ -57,8 +57,33 @@ const verifyToken = (req, res, next) => {
 
 async function run() {
   try {
+    const db = client.db('project-micromint');
+    const usersCollection = db.collection('users')
+    
+    //save and update user on database
+    app.post('/users/:email', async(req, res)=>{
+      
+      const email = req.params.email;
+      const query = {email}
+      const user = req.body;
+
+      //check user already exists
+      const isExist = await usersCollection.findOne(query)
+      if(isExist) return res.send(isExist)
+      
+      //else save user on db
+      const result = await usersCollection.insertOne({
+        ...user, 
+        role: user.role || 'worker',
+        timestamp: Date.now(),
+      });
+      res.send(result);  
+    })
+    
+    
+    
+    
     // await client.connect();
-    // --- AUTH ROUTES ---
 
     // Issue token
     app.post('/jwt', (req, res) => {
