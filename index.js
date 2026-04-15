@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -57,8 +57,32 @@ const verifyToken = (req, res, next) => {
 
 async function run() {
   try {
+    // Issue token
+    app.post('/jwt', (req, res) => {
+      const { email } = req.body;
+      if (!email) return res.status(400).send({ message: 'Email is required' });
+
+      const token = jwt.sign({ email }, process.env.JWT_SECRET, {
+        expiresIn: '7d',
+      });
+
+      res.cookie('token', token, cookieOptions).send({ success: true });
+    });
+
+    // Logout
+    app.post('/logout', (req, res) => {
+      res.clearCookie('token', {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      }).send({ success: true });
+    });
+
+
     const db = client.db('project-micromint');
-    const usersCollection = db.collection('users')
+    const usersCollection = db.collection('users');
+    const taskCollection = db.collection('tasks');
+    const submittedTasksCollection = db.collection('submitted_tasks');
     
     //save and update user on database
     app.post('/users/:email', async(req, res)=>{
@@ -80,31 +104,57 @@ async function run() {
       res.send(result);  
     })
     
+    //save add task to the tasks collection
+    app.post('/tasks', async(req, res)=>{
+      const task = req.body;
+      const result = await taskCollection.insertOne(task);
+      res.send(result)
+    })
+
+    //get all tasks
+    app.get('/tasks', async(req, res)=>{
+      const result = await taskCollection.find().toArray();
+      res.send(result);
+    })
     
-    
-    
+    //get a specific task by id
+    app.get('/tasks/:id', async(req, res)=>{
+      const id = req.params.id;
+      const query = {_id: new ObjectId(id)};
+      const result = await taskCollection.findOne(query);
+      res.send(result)
+    })
+
+
+    //save submitted_tasks on the database also patch i.e., update task workers
+    app.post('/submitted-task', async(req, res)=>{
+      const { task_id, submission_details, worker_email, worker_name } = req.body;
+      const task = await db.collection("tasks").findOne({ _id: new ObjectId(task_id) });
+      if (!task) {
+        return res.status(404).json({ message: "Task not found" });
+      }
+      const newSubmission = {
+      task_id: task_id,
+      task_title: task.task_title,
+      payable_amount: task.payable_amount,
+      worker: {email: worker_email, name: worker_name},
+      submission_details: submission_details,
+      buyer: {name: task.buyer.name, email: task.buyer.email},
+      current_date: new Date().toISOString().split("T")[0], 
+      status: "pending"
+    };
+      const result = await submittedTasksCollection.insertOne(newSubmission);
+      await taskCollection.updateOne({ _id: new ObjectId(task_id)},{
+          $inc: { required_workers: -1 } 
+        } 
+      );
+      res.send(result);
+    })
+
+
     // await client.connect();
 
-    // Issue token
-    app.post('/jwt', (req, res) => {
-      const { email } = req.body;
-      if (!email) return res.status(400).send({ message: 'Email is required' });
-
-      const token = jwt.sign({ email }, process.env.JWT_SECRET, {
-        expiresIn: '7d',
-      });
-
-      res.cookie('token', token, cookieOptions).send({ success: true });
-    });
-
-    // Logout
-    app.post('/logout', (req, res) => {
-      res.clearCookie('token', {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      }).send({ success: true });
-    });
+    
 
     console.log('Connected to MongoDB!');
   } finally {
