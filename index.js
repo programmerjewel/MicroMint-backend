@@ -129,10 +129,7 @@ async function run() {
     //save submitted_tasks on the database also patch i.e., update task workers
     app.post('/submitted-task', async(req, res)=>{
       const { task_id, submission_details, worker_email, worker_name } = req.body;
-      const task = await db.collection("tasks").findOne({ _id: new ObjectId(task_id) });
-      if (!task) {
-        return res.status(404).json({ message: "Task not found" });
-      }
+      const task = await taskCollection.findOne({ _id: new ObjectId(task_id) });
       const newSubmission = {
       task_id: task_id,
       task_title: task.task_title,
@@ -151,6 +148,41 @@ async function run() {
       res.send(result);
     })
 
+    //get all submitted tasks for a specific worker
+    app.get('/submitted-task/:email', async(req, res)=>{
+      const email = req.params.email;
+      const query = {"worker.email" : email};
+      const result = await submittedTasksCollection.find(query).toArray();
+      res.send(result);
+    })
+
+    //delete or cancel submitted task
+    app.delete('/submitted-task/:id', async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+
+      const submission = await submittedTasksCollection.findOne(query);
+
+      // 1. Check if submission exists and is still pending
+      if (submission && submission.status.toLowerCase() === 'pending') {
+        
+        // 2. Delete the submission
+        const result = await submittedTasksCollection.deleteOne(query);
+
+        // 3. Refund the worker slot to the task
+        await taskCollection.updateOne(
+          { _id: new ObjectId(submission.task_id) },
+          { $inc: { required_workers: 1 } }
+        );
+        res.send(result);
+      } else {
+        res.send({ error: "Action not allowed or record not found" });
+      }
+    });
+
+
+
+ 
 
     // await client.connect();
 
