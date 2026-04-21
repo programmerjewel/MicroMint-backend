@@ -163,6 +163,116 @@ async function run() {
       }
     });
 
+    // User submits role change request
+    app.post('/role-requests', verifyToken, async (req, res) => {
+      const email = req.user.email;
+      const { requestedRole } = req.body;
+
+      try {
+        
+        //Fetch current user to check their existing role
+        const currentUser = await usersCollection.findOne({ email });
+        
+        //Block request if the user is already an Admin
+        if (currentUser?.role === 'admin') {
+          return res.status(403).send({ message: 'Admins cannot request role changes.' });
+        }
+        
+        const allowedRoles = ['worker', 'buyer'];
+        if (!allowedRoles.includes(requestedRole)) {
+          return res.status(400).send({ message: 'Invalid role requested' });
+        }
+
+        const existingRequest = await roleRequestsCollection.findOne({
+          email,
+          status: 'pending',
+        });
+
+        if (existingRequest) {
+          return res.status(409).send({ message: 'You already have a pending request' });
+        }
+
+        await roleRequestsCollection.insertOne({
+          email,
+          requestedRole,
+          status: 'pending',
+          requestDate: new Date(),
+        });
+
+        res.send({ success: true });
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to submit request' });
+      }
+    });
+
+    // User checks their own pending request
+    app.get('/role-requests/:email/pending', verifyToken, async (req, res) => {
+      const email = req.params.email;
+
+      try {
+        if (req.user.email !== email) {
+          return res.status(403).send({ message: 'Forbidden' });
+        }
+
+        const result = await roleRequestsCollection.findOne({
+          email,
+          status: 'pending',
+        });
+
+        res.send(result ?? null);
+      } catch (error) {
+        res.status(500).send({ message: 'Error fetching request' });
+      }
+    });
+
+    // Admin gets all pending role requests
+    app.get('/role-requests', verifyToken, async (req, res) => {
+      try {
+        const result = await roleRequestsCollection.find({ status: 'pending' }).toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to fetch requests' });
+      }
+    });
+
+    // Admin approves or rejects a role request
+    app.patch('/role-requests/:id', verifyToken,  async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body;
+
+      try {
+        if (!['approved', 'rejected'].includes(status)) {
+          return res.status(400).send({ message: 'Invalid status' });
+        }
+
+        const request = await roleRequestsCollection.findOne({ _id: new ObjectId(id) });
+        if (!request) return res.status(404).send({ message: 'Request not found' });
+        if (request.status !== 'pending') {
+          return res.status(400).send({ message: 'Request already processed' });
+        }
+
+        await roleRequestsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status, resolvedAt: new Date() } }
+        );
+
+        if (status === 'approved') {
+          await usersCollection.updateOne(
+            { email: request.email },
+            { $set: { role: request.requestedRole } }
+          );
+        }
+
+        res.send({ success: true });
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to process request' });
+      }
+    });
+
+  
+
+
+
     //save add task to the tasks collection
     app.post("/tasks", async (req, res) => {
       const task = req.body;
