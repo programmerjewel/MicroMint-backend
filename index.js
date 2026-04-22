@@ -269,8 +269,14 @@ async function run() {
       }
     });
 
-  
-
+      app.get('/users', verifyToken, async (req, res) => {
+  try {
+    const result = await usersCollection.find().toArray();
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: 'Failed to fetch users' });
+  }
+});
 
 
     //save add task to the tasks collection
@@ -281,7 +287,7 @@ async function run() {
     });
 
     //get all tasks
-    app.get("/tasks", async (req, res) => {
+    app.get("/tasks", verifyToken, async (req, res) => {
       const result = await taskCollection.find().toArray();
       res.send(result);
     });
