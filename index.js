@@ -112,7 +112,7 @@ async function run() {
       }
     });
 
-     // Get user by email
+    // Get user by email
     app.get('/users/:email', verifyToken, async (req, res) => {
       const email = req.params.email;
 
@@ -172,12 +172,12 @@ async function run() {
         
         //Fetch current user to check their existing role
         const currentUser = await usersCollection.findOne({ email });
-        
+
         //Block request if the user is already an Admin
         if (currentUser?.role === 'admin') {
           return res.status(403).send({ message: 'Admins cannot request role changes.' });
         }
-        
+
         const allowedRoles = ['worker', 'buyer'];
         if (!allowedRoles.includes(requestedRole)) {
           return res.status(400).send({ message: 'Invalid role requested' });
@@ -270,13 +270,13 @@ async function run() {
     });
 
       app.get('/users', verifyToken, async (req, res) => {
-  try {
-    const result = await usersCollection.find().toArray();
-    res.send(result);
-  } catch (error) {
+      try {
+        const result = await usersCollection.find().toArray();
+        res.send(result);
+      } catch (error) {
     res.status(500).send({ message: 'Failed to fetch users' });
-  }
-});
+      }
+    });
 
 
     //save add task to the tasks collection
@@ -292,41 +292,202 @@ async function run() {
       res.send(result);
     });
 
-    //get a specific task by id
-    app.get("/tasks/:id", async (req, res) => {
+    //get tasks data by email for buyer
+    app.get("/tasks/buyer/:email", verifyToken, async (req, res) => {
+      const email = req.params.email;
+      const query = { "buyer.email": email };
+      const result = await taskCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    //get a specific task by id and also check whether worker submitted 
+    app.get("/tasks/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
-      const result = await taskCollection.findOne(query);
-      res.send(result);
+      const task = await taskCollection.findOne(query);
+      if(!task) return res.status(404).send({ message: "Task not found" });
+
+      const existingSubmittedTask = await submittedTasksCollection.findOne({
+        task_id: id,
+        "worker.email": req.user.email,
+      })
+      res.send({...task, submissionStatus: existingSubmittedTask ? existingSubmittedTask.status : null});
+    });
+
+    //update task info buyer
+    app.patch("/tasks/:id", verifyToken, async (req, res) => {
+      const id = req.params.id;
+      const buyerEmail = req.user.email;
+      try {
+        //fetch task first
+        const task = await taskCollection.findOne({ _id: new ObjectId(id) });
+        if (!task)
+          return res.status(404).send({ message: "Forbidden: Not your task" });
+
+        //check buyer email
+        if (task.buyer.email !== buyerEmail) {
+          return res.status(403).send({ message: "Forbidden: Not your task" });
+        }
+
+        const {
+          task_title,
+          task_detail,
+          required_workers,
+          payable_amount,
+          completion_date,
+          submission_info,
+        } = req.body;
+
+        const updateFields = {};
+        const errors = [];
+
+        //count existing submissions once to avoid redundant DB calls
+        const activeSubmissions = await submittedTasksCollection.countDocuments(
+          {
+            task_id: id,
+            status: { $ne: "rejected" },
+          },
+        );
+
+        if (task_title) updateFields.task_title = task_title;
+        if (task_detail) updateFields.task_detail = task_detail;
+        if (submission_info) updateFields.submission_info = submission_info;
+        if (completion_date) {
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          if (new Date(completion_date) < today) {
+            errors.push("Completion date cannot be in the past");
+          } else {
+            updateFields.completion_date = completion_date;
+          }
+        }
+
+        // Logic: required_workers from frontend represents the NEW TOTAL target
+        if (required_workers !== undefined) {
+          const newTotalWorkers = Number(required_workers);
+          if (newTotalWorkers < activeSubmissions) {
+            errors.push(
+              `Total workers cannot be less than active submissions (${activeSubmissions})`,
+            );
+          } else {
+            // We store the "remaining slots" in required_workers
+            updateFields.required_workers = newTotalWorkers - activeSubmissions;
+
+            // Recalculate total escrow/payable amount
+            const price =
+              payable_amount !== undefined
+                ? Number(payable_amount)
+                : Number(task.payable_amount);
+            updateFields.total_payable_amount = newTotalWorkers * price;
+          }
+        }
+        if (payable_amount !== undefined) {
+          const newPrice = Number(payable_amount);
+          if (newPrice < task.payable_amount) {
+            errors.push("Payable amount per worker can only be increased");
+          } else {
+            updateFields.payable_amount = newPrice;
+
+            // If workers weren't updated in this request, recalculate total based on existing total target
+            if (required_workers === undefined) {
+              const currentTotalWorkers =
+                Number(task.required_workers) + activeSubmissions;
+              updateFields.total_payable_amount =
+                currentTotalWorkers * newPrice;
+            }
+          }
+        }
+        if (errors.length > 0) {
+          return res.status(400).send({ message: errors.join("; ") });
+        }
+
+        if (Object.keys(updateFields).length === 0) {
+          return res.status(400).send({ message: "No valid changes detected" });
+        }
+
+        await taskCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateFields },
+        );
+
+        const updatedTask = await taskCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        res.send(updatedTask);
+      } catch (error) {
+        console.error("Task Update Error:", error);
+        res
+          .status(500)
+          .send({ message: "Failed to update task due to a server error" });
+      }
     });
 
     //save submitted_tasks on the database also patch i.e., update task workers
-    app.post("/submitted-task", async (req, res) => {
-      const { task_id, submission_details, worker_email, worker_name } =
-        req.body;
-      const task = await taskCollection.findOne({ _id: new ObjectId(task_id) });
-      const newSubmission = {
-        task_id: task_id,
-        task_title: task.task_title,
-        payable_amount: task.payable_amount,
-        worker: { email: worker_email, name: worker_name },
-        submission_details: submission_details,
-        buyer: { name: task.buyer.name, email: task.buyer.email },
-        current_date: new Date().toISOString().split("T")[0],
-        status: "pending",
-      };
-      const result = await submittedTasksCollection.insertOne(newSubmission);
-      await taskCollection.updateOne(
-        { _id: new ObjectId(task_id) },
-        {
-          $inc: { required_workers: -1 },
-        },
-      );
-      res.send(result);
+    app.post("/submitted-task", verifyToken, async (req, res) => {
+      const { task_id, submission_details, worker_email, worker_name } = req.body;
+      try {
+        //check status for block the submission
+        const activeSubmission = await submittedTasksCollection.findOne({
+          task_id: task_id,
+          "worker.email": worker_email,
+          status: {$in: ["pending", "approved"]}
+        });
+        if (activeSubmission) {
+          return res
+            .status(400)
+            .send({ message: "You have already have a pending or approved submission." });
+        }
+
+        //now check if this is a re-submission of a rejected task
+        const prevRejected = await submittedTasksCollection.findOne({
+          task_id: task_id,
+          "worker.email": worker_email,
+          status: "rejected",
+        })
+
+        const task = await taskCollection.findOne({
+          _id: new ObjectId(task_id),
+        });
+
+        if (!prevRejected && (!task || task.required_workers <= 0)) {
+          return res
+            .status(400)
+            .send({ message: "Task is no longer available." });
+        }
+        //Create the submission
+        const newSubmission = {
+          task_id: task_id,
+          task_title: task.task_title,
+          payable_amount: task.payable_amount,
+          worker: { email: worker_email, name: worker_name },
+          submission_details: submission_details,
+          buyer: { name: task.buyer.name, email: task.buyer.email },
+          current_date: new Date().toISOString().split("T")[0],
+          status: "pending",
+        };
+
+        // then upsert the submission-Update if rejected, Insert if new
+        const result = await submittedTasksCollection.updateOne(
+          { task_id, "worker.email": worker_email },
+          { $set: newSubmission },
+          { upsert: true }
+        );
+
+        //only decrease slot if this is worker's first attempt
+        if (!prevRejected) {
+          await taskCollection.updateOne(
+          { _id: new ObjectId(task_id) },
+          { $inc: { required_workers: -1 } }
+        );
+    }
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to submit task" });
+      }
     });
 
     //get all submitted tasks for a specific worker
-    app.get("/submitted-task/:email", async (req, res) => {
+    app.get("/submitted-task/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
       const query = { "worker.email": email };
       const result = await submittedTasksCollection.find(query).toArray();
@@ -334,7 +495,7 @@ async function run() {
     });
 
     //delete or cancel submitted task
-    app.delete("/submitted-task/:id", async (req, res) => {
+    app.delete("/submitted-task/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
 
@@ -353,6 +514,54 @@ async function run() {
         res.send(result);
       } else {
         res.send({ error: "Action not allowed or record not found" });
+      }
+    });
+
+    //get worker stats
+    app.get("/worker-stats/:email", verifyToken, async (req, res) => {
+      const email = req.params.email;
+
+      //check user is request their own stats
+      if (req.user.email !== email) {
+        return res.status(403).send({ message: "Forbidden Access" });
+      }
+
+      try {
+        const stats = await submittedTasksCollection
+          .aggregate([
+            //filter only this worker's submission data
+            { $match: { "worker.email": email } },
+            {
+              $group: {
+                _id: null,
+                totalSubmissions: { $sum: 1 },
+                totalPendingSubmissions: {
+                  $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] },
+                },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                totalSubmissions: 1,
+                totalPendingSubmissions: 1,
+              },
+            },
+          ])
+          .toArray();
+
+        const result =
+          stats.length > 0
+            ? stats[0]
+            : {
+                totalSubmissions: 0,
+                totalPendingSubmissions: 0,
+                totalEarnings: 0,
+              };
+        res.send(result);
+      } catch (error) {
+        console.error("Aggregation Error", error);
+        res.status(500).send({ message: "Internal Server Error" });
       }
     });
 
