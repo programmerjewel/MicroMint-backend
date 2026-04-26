@@ -494,6 +494,78 @@ async function run() {
       res.send(result);
     });
 
+    // Get all pending submissions for a specific buyer
+      app.get("/submitted-task/buyer/:email", verifyToken, async (req, res) => {
+        const email = req.params.email;
+        try {
+          if (req.user.email !== email) {
+            return res.status(403).send({ message: "Forbidden" });
+          }
+          const result = await submittedTasksCollection
+            .find({ "buyer.email": email, status: "pending" })
+            .toArray();
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "Failed to fetch submissions" });
+        }
+      });
+
+
+    // Approve or reject a submission
+    app.patch("/submitted-task/:id/review", verifyToken, async (req, res) => {
+      const id = req.params.id;
+
+      // get updated status from body (approved or rejected)
+      const { action } = req.body;
+
+      try {
+        // validation of unknown status
+        if (!["approved", "rejected"].includes(action)) {
+          return res.status(400).send({ message: "Invalid action" });
+        }
+
+        const submission = await submittedTasksCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!submission) return res.status(404).send({ message: "Submission not found" });
+
+        // Guard: only the task's buyer can review
+        if (submission.buyer.email !== req.user.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
+
+        if (submission.status !== "pending") {
+          return res.status(400).send({ message: "Submission already reviewed" });
+        }
+
+        await submittedTasksCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: action, reviewedAt: new Date() } }
+        );
+
+        if (action === "rejected") {
+          // Refund the task slot
+          await taskCollection.updateOne(
+            { _id: new ObjectId(submission.task_id) },
+            { $inc: { required_workers: 1 } }
+          );
+        }
+
+        // if (action === "approved") {
+        //   // Credit coins to the worker
+        //   await usersCollection.updateOne(
+        //     { email: submission.worker.email },
+        //     { $inc: { coins: submission.payable_amount } }
+        //   );
+        // }
+
+        res.send({ success: true });
+      } catch (error) {
+        console.error("Review error:", error);
+        res.status(500).send({ message: "Failed to process review" });
+      }
+    });
+
     //delete or cancel submitted task
     app.delete("/submitted-task/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
