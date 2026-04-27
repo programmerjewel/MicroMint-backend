@@ -269,12 +269,12 @@ async function run() {
       }
     });
 
-      app.get('/users', verifyToken, async (req, res) => {
+    app.get('/users', verifyToken, async (req, res) => {
       try {
         const result = await usersCollection.find().toArray();
         res.send(result);
       } catch (error) {
-    res.status(500).send({ message: 'Failed to fetch users' });
+        res.status(500).send({ message: 'Failed to fetch users' });
       }
     });
 
@@ -637,6 +637,109 @@ async function run() {
       }
     });
 
+//get buyer stats
+    app.get("/buyer-stats/:email", verifyToken, async(req, res)=>{
+      const email = req.params.email;
+      
+      //check user is request their own stats
+      if (req.user.email !== email) {
+        return res.status(403).send({ message: "Forbidden Access" });
+      }
+
+      try {
+        const [ taskStats, paymentStats] = await Promise.all([
+          taskCollection.aggregate([
+            { $match: { "buyer.email": email } },
+            {
+              $group: {
+                _id: null,
+                totalTasks: { $sum: 1 },
+                totalPendingWorkers: { $sum: "$required_workers" },
+              }
+            },
+            {
+              $project: {
+                _id: 0, totalTasks: 1, totalPendingWorkers: 1 } 
+              }
+          ]).toArray(),
+
+          submittedTasksCollection.aggregate([
+          { $match: { "buyer.email": email, status: "approved" } },
+          {
+            $group: {
+              _id: null,
+              totalPaymentsPaid: { $sum: "$payable_amount" },
+            },
+          },
+          { 
+            $project: {
+               _id: 0, totalPaymentsPaid: 1 } 
+          },
+        ]).toArray(),
+        ]);
+        res.send({
+          totalTasks: taskStats[0]?.totalTasks ?? 0,
+          totalPendingWorkers: taskStats[0]?.totalPendingWorkers ?? 0,
+          totalPaymentsPaid: paymentStats[0]?.totalPaymentsPaid ?? 0,
+        });
+        
+      } catch(error) {
+        console.error("Buyer stats error:", error);
+        res.status(500).send({ message: "Failed to fetch buyer stats" });
+      }
+
+    }) 
+
+    //get admin stats
+    app.get("/admin-stats", verifyToken, async (req, res) => {
+  try {
+    const [userStats, paymentStats] = await Promise.all([
+
+      // From users collection: count workers, buyers, sum all coins
+      usersCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalWorkers: {
+                $sum: { $cond: [{ $eq: ["$role", "worker"] }, 1, 0] },
+              },
+              totalBuyers: {
+                $sum: { $cond: [{ $eq: ["$role", "buyer"] }, 1, 0] },
+              },
+              totalCoins: { $sum: { $ifNull: ["$coins", 0] } },
+            },
+          },
+          { $project: { _id: 0, totalWorkers: 1, totalBuyers: 1, totalCoins: 1 } },
+        ])
+        .toArray(),
+
+      // From submitted_tasks: sum payable_amount where approved
+      submittedTasksCollection
+        .aggregate([
+          { $match: { status: "approved" } },
+          {
+            $group: {
+              _id: null,
+              totalPayments: { $sum: "$payable_amount" },
+            },
+          },
+          { $project: { _id: 0, totalPayments: 1 } },
+        ])
+        .toArray(),
+    ]);
+
+    res.send({
+      totalWorkers: userStats[0]?.totalWorkers ?? 0,
+      totalBuyers: userStats[0]?.totalBuyers ?? 0,
+      totalCoins: userStats[0]?.totalCoins ?? 0,
+      totalPayments: paymentStats[0]?.totalPayments ?? 0,
+    });
+  } catch (error) {
+    console.error("Admin stats error:", error);
+    res.status(500).send({ message: "Failed to fetch admin stats" });
+  }
+});
     // await client.connect();
 
     console.log("Connected to MongoDB!");
