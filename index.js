@@ -84,65 +84,76 @@ async function run() {
     const taskCollection = db.collection("tasks");
     const submittedTasksCollection = db.collection("submitted_tasks");
     const roleRequestsCollection = db.collection("user_role_requests");
+    const transactionsCollection = db.collection("transactions");
 
     // Register and save user on db — form or google sign in
-    app.post('/users', async (req, res) => {
+    app.post("/users", async (req, res) => {
       const { name, email, image, role } = req.body;
 
       try {
         const isExist = await usersCollection.findOne({ email });
         if (isExist) return res.send(isExist);
 
-        const allowedRoles = ['worker', 'buyer'];
-        const safeRole = allowedRoles.includes(role) ? role : 'worker';
+        const allowedRoles = ["worker", "buyer"];
+        const defaultRole = allowedRoles.includes(role) ? role : "worker";
+        const initialCoins = defaultRole === "buyer" ?  parseInt(process.env.DEFAULT_COIN_BUYER) : parseInt(process.env.DEFAULT_COIN_WORKER);
 
         const newUser = {
           name,
           email,
           image,
-          role: safeRole,
+          role: defaultRole,
+          coins: initialCoins,
           timestamp: Date.now(),
         };
 
         await usersCollection.insertOne(newUser);
-        res.status(201).send(newUser);
 
+        await transactionsCollection.insertOne({
+          receiver_email: email,
+          amount: initialCoins,
+          type: "signup_bonus",
+          status: "completed",
+          description: "Welcome Bonus",
+          timestamp: new Date(),
+        });
+        res.status(201).send(newUser);
       } catch (error) {
-        res.status(500).send({ message: 'Failed to save user' });
+        res.status(500).send({ message: "Failed to save user" });
       }
     });
 
     // Get user by email
-    app.get('/users/:email', verifyToken, async (req, res) => {
+    app.get("/users/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
 
       try {
         if (req.user.email !== email) {
-          return res.status(403).send({ message: 'Forbidden' });
+          return res.status(403).send({ message: "Forbidden" });
         }
 
         const user = await usersCollection.findOne({ email });
-        if (!user) return res.status(404).send({ message: 'User not found' });
+        if (!user) return res.status(404).send({ message: "User not found" });
 
         res.send(user);
       } catch (error) {
-        res.status(500).send({ message: 'Failed to fetch user' });
+        res.status(500).send({ message: "Failed to fetch user" });
       }
     });
 
     // Update name and image only — no role
-    app.patch('/users/:email', verifyToken, async (req, res) => {
+    app.patch("/users/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
       const { name, image } = req.body;
 
       try {
         if (req.user.email !== email) {
-          return res.status(403).send({ message: 'Forbidden' });
+          return res.status(403).send({ message: "Forbidden" });
         }
 
         const existingUser = await usersCollection.findOne({ email });
         if (!existingUser) {
-          return res.status(404).send({ message: 'User not found' });
+          return res.status(404).send({ message: "User not found" });
         }
 
         const updateFields = {};
@@ -150,134 +161,140 @@ async function run() {
         if (image) updateFields.image = image;
 
         if (Object.keys(updateFields).length === 0) {
-          return res.status(400).send({ message: 'No valid fields to update' });
+          return res.status(400).send({ message: "No valid fields to update" });
         }
 
         await usersCollection.updateOne({ email }, { $set: updateFields });
 
         const updatedUser = await usersCollection.findOne({ email });
         res.send(updatedUser);
-
       } catch (error) {
-        res.status(500).send({ message: 'Update failed' });
+        res.status(500).send({ message: "Update failed" });
       }
     });
 
     // User submits role change request
-    app.post('/role-requests', verifyToken, async (req, res) => {
+    app.post("/role-requests", verifyToken, async (req, res) => {
       const email = req.user.email;
       const { requestedRole } = req.body;
 
       try {
-        
         //Fetch current user to check their existing role
         const currentUser = await usersCollection.findOne({ email });
 
         //Block request if the user is already an Admin
-        if (currentUser?.role === 'admin') {
-          return res.status(403).send({ message: 'Admins cannot request role changes.' });
+        if (currentUser?.role === "admin") {
+          return res
+            .status(403)
+            .send({ message: "Admins cannot request role changes." });
         }
 
-        const allowedRoles = ['worker', 'buyer'];
+        const allowedRoles = ["worker", "buyer"];
         if (!allowedRoles.includes(requestedRole)) {
-          return res.status(400).send({ message: 'Invalid role requested' });
+          return res.status(400).send({ message: "Invalid role requested" });
         }
 
         const existingRequest = await roleRequestsCollection.findOne({
           email,
-          status: 'pending',
+          status: "pending",
         });
 
         if (existingRequest) {
-          return res.status(409).send({ message: 'You already have a pending request' });
+          return res
+            .status(409)
+            .send({ message: "You already have a pending request" });
         }
 
         await roleRequestsCollection.insertOne({
           email,
           requestedRole,
-          status: 'pending',
+          status: "pending",
           requestDate: new Date(),
         });
 
         res.send({ success: true });
       } catch (error) {
-        res.status(500).send({ message: 'Failed to submit request' });
+        res.status(500).send({ message: "Failed to submit request" });
       }
     });
 
     // User checks their own pending request
-    app.get('/role-requests/:email/pending', verifyToken, async (req, res) => {
+    app.get("/role-requests/:email/pending", verifyToken, async (req, res) => {
       const email = req.params.email;
 
       try {
         if (req.user.email !== email) {
-          return res.status(403).send({ message: 'Forbidden' });
+          return res.status(403).send({ message: "Forbidden" });
         }
 
         const result = await roleRequestsCollection.findOne({
           email,
-          status: 'pending',
+          status: "pending",
         });
 
         res.send(result ?? null);
       } catch (error) {
-        res.status(500).send({ message: 'Error fetching request' });
+        res.status(500).send({ message: "Error fetching request" });
       }
     });
 
     // Admin gets all pending role requests
-    app.get('/role-requests', verifyToken, async (req, res) => {
+    app.get("/role-requests", verifyToken, async (req, res) => {
       try {
-        const result = await roleRequestsCollection.find({ status: 'pending' }).toArray();
+        const result = await roleRequestsCollection
+          .find({ status: "pending" })
+          .toArray();
         res.send(result);
       } catch (error) {
-        res.status(500).send({ message: 'Failed to fetch requests' });
+        res.status(500).send({ message: "Failed to fetch requests" });
       }
     });
 
     // Admin approves or rejects a role request
-    app.patch('/role-requests/:id', verifyToken,  async (req, res) => {
+    app.patch("/role-requests/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
       const { status } = req.body;
 
       try {
-        if (!['approved', 'rejected'].includes(status)) {
-          return res.status(400).send({ message: 'Invalid status' });
+        if (!["approved", "rejected"].includes(status)) {
+          return res.status(400).send({ message: "Invalid status" });
         }
 
-        const request = await roleRequestsCollection.findOne({ _id: new ObjectId(id) });
-        if (!request) return res.status(404).send({ message: 'Request not found' });
-        if (request.status !== 'pending') {
-          return res.status(400).send({ message: 'Request already processed' });
+        const request = await roleRequestsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!request)
+          return res.status(404).send({ message: "Request not found" });
+        if (request.status !== "pending") {
+          return res.status(400).send({ message: "Request already processed" });
         }
 
         await roleRequestsCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $set: { status, resolvedAt: new Date() } }
+          { $set: { status, resolvedAt: new Date() } },
         );
 
-        if (status === 'approved') {
+        if (status === "approved") {
           await usersCollection.updateOne(
             { email: request.email },
-            { $set: { role: request.requestedRole } }
+            { $set: { role: request.requestedRole } },
           );
         }
 
         res.send({ success: true });
       } catch (error) {
-        res.status(500).send({ message: 'Failed to process request' });
+        res.status(500).send({ message: "Failed to process request" });
       }
     });
 
-    app.get('/users', verifyToken, async (req, res) => {
+    app.get("/users", verifyToken, async (req, res) => {
       try {
         const result = await usersCollection.find().toArray();
         res.send(result);
       } catch (error) {
-        res.status(500).send({ message: 'Failed to fetch users' });
+        res.status(500).send({ message: "Failed to fetch users" });
       }
     });
-
 
     //save add task to the tasks collection
     app.post("/tasks", async (req, res) => {
@@ -300,18 +317,23 @@ async function run() {
       res.send(result);
     });
 
-    //get a specific task by id and also check whether worker submitted 
+    //get a specific task by id and also check whether worker submitted
     app.get("/tasks/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
       const task = await taskCollection.findOne(query);
-      if(!task) return res.status(404).send({ message: "Task not found" });
+      if (!task) return res.status(404).send({ message: "Task not found" });
 
       const existingSubmittedTask = await submittedTasksCollection.findOne({
         task_id: id,
         "worker.email": req.user.email,
-      })
-      res.send({...task, submissionStatus: existingSubmittedTask ? existingSubmittedTask.status : null});
+      });
+      res.send({
+        ...task,
+        submissionStatus: existingSubmittedTask
+          ? existingSubmittedTask.status
+          : null,
+      });
     });
 
     //update task info buyer
@@ -424,37 +446,58 @@ async function run() {
 
     //save submitted_tasks on the database also patch i.e., update task workers
     app.post("/submitted-task", verifyToken, async (req, res) => {
-      const { task_id, submission_details, worker_email, worker_name } = req.body;
+      const { task_id, submission_details, worker_email, worker_name } =
+        req.body;
+
       try {
-        //check status for block the submission
+        // Existing check for pending/approved submissions
         const activeSubmission = await submittedTasksCollection.findOne({
           task_id: task_id,
           "worker.email": worker_email,
-          status: {$in: ["pending", "approved"]}
+          status: { $in: ["pending", "approved"] },
         });
+
         if (activeSubmission) {
-          return res
-            .status(400)
-            .send({ message: "You have already have a pending or approved submission." });
+          return res.status(400).send({
+            message: "You already have a pending or approved submission.",
+          });
         }
 
-        //now check if this is a re-submission of a rejected task
-        const prevRejected = await submittedTasksCollection.findOne({
-          task_id: task_id,
-          "worker.email": worker_email,
-          status: "rejected",
-        })
-
+        // Fetch the task to check slots and deadline
         const task = await taskCollection.findOne({
           _id: new ObjectId(task_id),
         });
 
-        if (!prevRejected && (!task || task.required_workers <= 0)) {
+        if (!task) {
+          return res.status(404).send({ message: "Task not found." });
+        }
+
+        // Deadline check in YYYY-MM-DD format
+        const today = new Date().toISOString().slice(0, 10);
+        const deadline = task.completion_date.slice(0, 10);
+
+        if (today > deadline) {
+          return res.status(400).send({
+            message:
+              "The deadline for this task has passed. Submissions are closed.",
+          });
+        }
+
+        // Check if this is a re-submission
+        const prevRejected = await submittedTasksCollection.findOne({
+          task_id: task_id,
+          "worker.email": worker_email,
+          status: "rejected",
+        });
+
+        // Check worker availability
+        if (!prevRejected && task.required_workers <= 0) {
           return res
             .status(400)
-            .send({ message: "Task is no longer available." });
+            .send({ message: "Task is no longer available (slots full)." });
         }
-        //Create the submission
+
+        // Create and Upsert Submission
         const newSubmission = {
           task_id: task_id,
           task_title: task.task_title,
@@ -462,26 +505,27 @@ async function run() {
           worker: { email: worker_email, name: worker_name },
           submission_details: submission_details,
           buyer: { name: task.buyer.name, email: task.buyer.email },
-          current_date: new Date().toISOString().split("T")[0],
+          current_date: today,
           status: "pending",
         };
 
-        // then upsert the submission-Update if rejected, Insert if new
         const result = await submittedTasksCollection.updateOne(
           { task_id, "worker.email": worker_email },
           { $set: newSubmission },
-          { upsert: true }
+          { upsert: true },
         );
 
-        //only decrease slot if this is worker's first attempt
+        // Only decrease slot if this is worker's first attempt
         if (!prevRejected) {
           await taskCollection.updateOne(
-          { _id: new ObjectId(task_id) },
-          { $inc: { required_workers: -1 } }
-        );
-    }
+            { _id: new ObjectId(task_id) },
+            { $inc: { required_workers: -1 } },
+          );
+        }
+
         res.send(result);
       } catch (error) {
+        console.error("Submission Error:", error);
         res.status(500).send({ message: "Failed to submit task" });
       }
     });
@@ -495,21 +539,20 @@ async function run() {
     });
 
     // Get all pending submissions for a specific buyer
-      app.get("/submitted-task/buyer/:email", verifyToken, async (req, res) => {
-        const email = req.params.email;
-        try {
-          if (req.user.email !== email) {
-            return res.status(403).send({ message: "Forbidden" });
-          }
-          const result = await submittedTasksCollection
-            .find({ "buyer.email": email, status: "pending" })
-            .toArray();
-          res.send(result);
-        } catch (error) {
-          res.status(500).send({ message: "Failed to fetch submissions" });
+    app.get("/submitted-task/buyer/:email", verifyToken, async (req, res) => {
+      const email = req.params.email;
+      try {
+        if (req.user.email !== email) {
+          return res.status(403).send({ message: "Forbidden" });
         }
-      });
-
+        const result = await submittedTasksCollection
+          .find({ "buyer.email": email, status: "pending" })
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch submissions" });
+      }
+    });
 
     // Approve or reject a submission
     app.patch("/submitted-task/:id/review", verifyToken, async (req, res) => {
@@ -527,7 +570,8 @@ async function run() {
         const submission = await submittedTasksCollection.findOne({
           _id: new ObjectId(id),
         });
-        if (!submission) return res.status(404).send({ message: "Submission not found" });
+        if (!submission)
+          return res.status(404).send({ message: "Submission not found" });
 
         // Guard: only the task's buyer can review
         if (submission.buyer.email !== req.user.email) {
@@ -535,29 +579,47 @@ async function run() {
         }
 
         if (submission.status !== "pending") {
-          return res.status(400).send({ message: "Submission already reviewed" });
+          return res
+            .status(400)
+            .send({ message: "Submission already reviewed" });
         }
 
         await submittedTasksCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $set: { status: action, reviewedAt: new Date() } }
+          { $set: { status: action, reviewedAt: new Date() } },
         );
 
         if (action === "rejected") {
           // Refund the task slot
           await taskCollection.updateOne(
             { _id: new ObjectId(submission.task_id) },
-            { $inc: { required_workers: 1 } }
+            { $inc: { required_workers: 1 } },
           );
         }
 
-        // if (action === "approved") {
-        //   // Credit coins to the worker
-        //   await usersCollection.updateOne(
-        //     { email: submission.worker.email },
-        //     { $inc: { coins: submission.payable_amount } }
-        //   );
-        // }
+        if (action === "approved") {
+          await usersCollection.updateOne(
+            { email: submission.buyer.email },
+            { $inc: { coins: -submission.payable_amount } },
+          );
+
+          // Credit coins to the worker
+          await usersCollection.updateOne(
+            { email: submission.worker.email },
+            { $inc: { coins: submission.payable_amount } },
+          );
+
+          await transactionsCollection.insertOne({
+            receiver_email: submission.worker.email,
+            sender_email: submission.buyer.email,
+            amount: submission.payable_amount,
+            type: "payout",
+            task_id: submission.task_id,
+            task_title: submission.task_title,
+            status: "completed",
+            timestamp: new Date(),
+          });
+        }
 
         res.send({ success: true });
       } catch (error) {
@@ -593,7 +655,9 @@ async function run() {
     app.get("/worker-stats/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
 
-      //check user is request their own stats
+      //coin to dollar rate
+      const COIN_TO_DOLLAR_RATE = parseInt(process.env.COIN_TO_DOLLAR_RATE);
+
       if (req.user.email !== email) {
         return res.status(403).send({ message: "Forbidden Access" });
       }
@@ -601,7 +665,6 @@ async function run() {
       try {
         const stats = await submittedTasksCollection
           .aggregate([
-            //filter only this worker's submission data
             { $match: { "worker.email": email } },
             {
               $group: {
@@ -610,6 +673,16 @@ async function run() {
                 totalPendingSubmissions: {
                   $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] },
                 },
+                // Sum payable_amount ONLY for approved tasks
+                totalEarnings: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ["$status", "approved"] },
+                      "$payable_amount",
+                      0,
+                    ],
+                  },
+                },
               },
             },
             {
@@ -617,129 +690,170 @@ async function run() {
                 _id: 0,
                 totalSubmissions: 1,
                 totalPendingSubmissions: 1,
+                totalEarnings: 1,
               },
             },
           ])
           .toArray();
 
-        const result =
-          stats.length > 0
-            ? stats[0]
-            : {
-                totalSubmissions: 0,
-                totalPendingSubmissions: 0,
-                totalEarnings: 0,
-              };
-        res.send(result);
+        const {
+          totalSubmissions = 0,
+          totalPendingSubmissions = 0,
+          totalEarnings = 0,
+        } = stats[0] || {};
+
+        const totalEarningsDollar =
+          Math.round((totalEarnings / COIN_TO_DOLLAR_RATE) * 100) / 100;
+        res.send({
+          totalSubmissions,
+          totalPendingSubmissions,
+          totalEarnings,
+          totalEarningsDollar,
+        });
       } catch (error) {
         console.error("Aggregation Error", error);
         res.status(500).send({ message: "Internal Server Error" });
       }
     });
 
-//get buyer stats
-    app.get("/buyer-stats/:email", verifyToken, async(req, res)=>{
+    //get buyer stats
+    app.get("/buyer-stats/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
-      
+      const COIN_TO_DOLLAR_RATE = parseInt(process.env.COIN_TO_DOLLAR_RATE);
+
       //check user is request their own stats
       if (req.user.email !== email) {
         return res.status(403).send({ message: "Forbidden Access" });
       }
 
       try {
-        const [ taskStats, paymentStats] = await Promise.all([
-          taskCollection.aggregate([
-            { $match: { "buyer.email": email } },
-            {
-              $group: {
-                _id: null,
-                totalTasks: { $sum: 1 },
-                totalPendingWorkers: { $sum: "$required_workers" },
-              }
-            },
-            {
-              $project: {
-                _id: 0, totalTasks: 1, totalPendingWorkers: 1 } 
-              }
-          ]).toArray(),
+        const [taskStats, paymentStats] = await Promise.all([
+          taskCollection
+            .aggregate([
+              { $match: { "buyer.email": email } },
+              {
+                $group: {
+                  _id: null,
+                  totalTasks: { $sum: 1 },
+                  totalPendingWorkers: { $sum: "$required_workers" },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  totalTasks: 1,
+                  totalPendingWorkers: 1,
+                },
+              },
+            ])
+            .toArray(),
 
-          submittedTasksCollection.aggregate([
-          { $match: { "buyer.email": email, status: "approved" } },
-          {
-            $group: {
-              _id: null,
-              totalPaymentsPaid: { $sum: "$payable_amount" },
-            },
-          },
-          { 
-            $project: {
-               _id: 0, totalPaymentsPaid: 1 } 
-          },
-        ]).toArray(),
+          submittedTasksCollection
+            .aggregate([
+              { $match: { "buyer.email": email, status: "approved" } },
+              {
+                $group: {
+                  _id: null,
+                  totalPaymentsPaidCoins: { $sum: "$payable_amount" },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  totalPaymentsPaidCoins: 1,
+                },
+              },
+            ])
+            .toArray(),
         ]);
         res.send({
           totalTasks: taskStats[0]?.totalTasks ?? 0,
           totalPendingWorkers: taskStats[0]?.totalPendingWorkers ?? 0,
-          totalPaymentsPaid: paymentStats[0]?.totalPaymentsPaid ?? 0,
+          totalPaymentsPaidCoins: paymentStats[0]?.totalPaymentsPaidCoins ?? 0,
+          totalPaymentsPaidDollar:
+            Math.round(
+              ((paymentStats[0]?.totalPaymentsPaidCoins ?? 0) /
+                COIN_TO_DOLLAR_RATE) *
+                100,
+            ) / 100,
         });
-        
-      } catch(error) {
+      } catch (error) {
         console.error("Buyer stats error:", error);
         res.status(500).send({ message: "Failed to fetch buyer stats" });
       }
-
-    }) 
+    });
 
     //get admin stats
     app.get("/admin-stats", verifyToken, async (req, res) => {
-  try {
-    const [userStats, paymentStats] = await Promise.all([
-
-      // From users collection: count workers, buyers, sum all coins
-      usersCollection
-        .aggregate([
-          {
-            $group: {
-              _id: null,
-              totalWorkers: {
-                $sum: { $cond: [{ $eq: ["$role", "worker"] }, 1, 0] },
+      const COIN_TO_DOLLAR_RATE = parseInt(process.env.COIN_TO_DOLLAR_RATE);
+      try {
+        const [userStats, paymentStats] = await Promise.all([
+          // From users collection: count workers, buyers, sum all coins
+          usersCollection
+            .aggregate([
+              {
+                $group: {
+                  _id: null,
+                  totalWorkers: {
+                    $sum: { $cond: [{ $eq: ["$role", "worker"] }, 1, 0] },
+                  },
+                  totalBuyers: {
+                    $sum: { $cond: [{ $eq: ["$role", "buyer"] }, 1, 0] },
+                  },
+                  totalCoins: { $sum: { $ifNull: ["$coins", 0] } },
+                },
               },
-              totalBuyers: {
-                $sum: { $cond: [{ $eq: ["$role", "buyer"] }, 1, 0] },
+              {
+                $project: {
+                  _id: 0,
+                  totalWorkers: 1,
+                  totalBuyers: 1,
+                  totalCoins: 1,
+                },
               },
-              totalCoins: { $sum: { $ifNull: ["$coins", 0] } },
-            },
-          },
-          { $project: { _id: 0, totalWorkers: 1, totalBuyers: 1, totalCoins: 1 } },
-        ])
-        .toArray(),
+            ])
+            .toArray(),
 
-      // From submitted_tasks: sum payable_amount where approved
-      submittedTasksCollection
-        .aggregate([
-          { $match: { status: "approved" } },
-          {
-            $group: {
-              _id: null,
-              totalPayments: { $sum: "$payable_amount" },
-            },
-          },
-          { $project: { _id: 0, totalPayments: 1 } },
-        ])
-        .toArray(),
-    ]);
+          // From submitted_tasks: sum payable_amount where approved
+          submittedTasksCollection
+            .aggregate([
+              { $match: { status: "approved" } },
+              {
+                $group: {
+                  _id: null,
+                  totalApprovedCoins: { $sum: "$payable_amount" },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  totalPaymentsCoins: "$totalApprovedCoins",
+                },
+              },
+            ])
+            .toArray(),
+        ]);
 
-    res.send({
-      totalWorkers: userStats[0]?.totalWorkers ?? 0,
-      totalBuyers: userStats[0]?.totalBuyers ?? 0,
-      totalCoins: userStats[0]?.totalCoins ?? 0,
-      totalPayments: paymentStats[0]?.totalPayments ?? 0,
+        res.send({
+          totalWorkers: userStats[0]?.totalWorkers ?? 0,
+          totalBuyers: userStats[0]?.totalBuyers ?? 0,
+          totalCoins: userStats[0]?.totalCoins ?? 0,
+          totalPaymentsCoins: paymentStats[0]?.totalPaymentsCoins ?? 0,
+          totalPaymentsUSD:
+            Math.round(
+              ((paymentStats[0]?.totalPaymentsCoins ?? 0) /
+                COIN_TO_DOLLAR_RATE) *
+                100,
+            ) / 100,
+        });
+      } catch (error) {
+        console.error("Admin stats error:", error);
+        res.status(500).send({ message: "Failed to fetch admin stats" });
+      }
     });
-  } catch (error) {
-    console.error("Admin stats error:", error);
-    res.status(500).send({ message: "Failed to fetch admin stats" });
-  }
-});
+
+   
+
     // await client.connect();
 
     console.log("Connected to MongoDB!");
