@@ -85,6 +85,7 @@ async function run() {
     const submittedTasksCollection = db.collection("submitted_tasks");
     const roleRequestsCollection = db.collection("user_role_requests");
     const transactionsCollection = db.collection("transactions");
+    const withdrawalsCollection = db.collection("withdrawals");
 
     // Register and save user on db — form or google sign in
     app.post("/users", async (req, res) => {
@@ -852,7 +853,136 @@ async function run() {
       }
     });
 
-   
+   //withdraw coin request
+    app.post("/withdrawals", verifyToken, async (req, res) => {
+      const withdrawalData = req.body;
+      const workerEmail = req.user.email;
+
+      try {
+        if (withdrawalData.worker_email !== workerEmail) {
+          return res.status(403).send({ message: "Forbidden Access" });
+        }
+
+        const { worker_name, withdrawal_coin, withdrawal_amount, payment_system, account_number } = withdrawalData;
+
+        if (!worker_name || !withdrawal_coin || !withdrawal_amount || !payment_system || !account_number) {
+          return res.status(400).send({ message: "All fields are required" });
+        }
+        const user = await usersCollection.findOne({ email: workerEmail });
+
+        if (!user) {
+          return res.status(403).send({ message: "User not found" });
+        }
+
+        const requestedCoins = Number(withdrawalData.withdrawal_coin);
+        const MIN_WITHDRAW_COINS = 200;
+
+        if (requestedCoins < MIN_WITHDRAW_COINS) {
+          return res.status(400).send({
+            message: `Minimum withdrawal is ${MIN_WITHDRAW_COINS} coins.`,
+          });
+        }
+
+        if (user.coins < requestedCoins) {
+          return res.status(400).send({ 
+            message: `Insufficient coins. You have ${user.coins} but requested ${requestedCoins}.` 
+          });
+        }
+
+        const withdrawalDoc = {
+          worker_email: withdrawalData.worker_email,
+          worker_name: withdrawalData.worker_name,
+          withdrawal_coin: requestedCoins,
+          withdrawal_amount: Number(withdrawalData.withdrawal_amount),
+          payment_system: withdrawalData.payment_system,
+          account_number: withdrawalData.account_number,
+          withdraw_date: new Date(withdrawalData.withdraw_date),
+          status: "pending",
+        };
+
+        const result = await withdrawalsCollection.insertOne(withdrawalDoc);
+        
+        await usersCollection.updateOne(
+          { email: workerEmail },
+          { $inc: { coins: -requestedCoins } }
+        );
+
+        await transactionsCollection.insertOne({
+          receiver_email: workerEmail, 
+          amount: requestedCoins,
+          type: "withdrawal",
+          status: "pending", 
+          description: `Withdrawal request via ${withdrawalData.payment_system}`,
+          withdrawal_id: result.insertedId,
+          timestamp: new Date(),
+        });
+
+        res.status(201).send({
+          success: true,
+          message: "Withdrawal request submitted successfully",
+          insertedId: result.insertedId
+        });
+      } catch (error) {
+        console.error("Withdrawal Error:", error);
+        res.status(500).send({ message: "Failed to process withdrawal request" });
+      }
+    });
+
+    //get all pending withdrawals for admin
+    app.get("/admin/withdrawals", verifyToken, async (req, res) => {
+      const result = await withdrawalsCollection.find({ status: "pending" }).toArray();
+      res.send(result);
+    });
+
+
+    // A single "State Machine" route to handle the lifecycle of a withdrawal
+    app.patch("/admin/withdraw-process/:id", verifyToken, async (req, res) => {
+      const id = req.params.id;
+      const { action } = req.body; // 'approve' or 'reject'
+      const filter = { _id: new ObjectId(id) };
+
+      try {
+        const request = await withdrawalsCollection.findOne(filter);
+        if (!request) return res.status(404).send({ message: "Request not found" });
+
+        // Safeguard: Don't process something already finished
+        if (request.status !== "pending") {
+          return res.status(400).send({ message: `This request is already ${request.status}` });
+        }
+
+        if (action === "approve") {
+          // 1. Update Withdrawal Status
+          await withdrawalsCollection.updateOne(filter, { $set: { status: "approved" } });
+          // 2. Mark Transaction as Completed
+          await transactionsCollection.updateOne(
+            { withdrawal_id: new ObjectId(id) },
+            { $set: { status: "completed" } }
+          );
+          return res.send({ success: true, message: "Withdrawal Approved & Paid" });
+        } 
+
+        if (action === "reject") {
+          // 1. Update Withdrawal Status
+          await withdrawalsCollection.updateOne(filter, { $set: { status: "rejected" } });
+          // 2. Refund Coins (CRITICAL STEP)
+          await usersCollection.updateOne(
+            { email: request.worker_email },
+            { $inc: { coins: request.withdrawal_coin } }
+          );
+          // 3. Mark Transaction as Rejected
+          await transactionsCollection.updateOne(
+            { withdrawal_id: new ObjectId(id) },
+            { $set: { status: "rejected" } }
+          );
+          return res.send({ success: true, message: "Withdrawal Rejected & Coins Refunded" });
+        }
+
+        res.status(400).send({ message: "Invalid action type" });
+      } catch (error) {
+        res.status(500).send({ message: "Process failed", error: error.message });
+      }
+    });
+
 
     // await client.connect();
 
