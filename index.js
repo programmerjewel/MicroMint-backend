@@ -3,15 +3,25 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+require('@dotenvx/dotenvx').config();
 const { DateTime } = require("luxon");
+const admin = require("firebase-admin");
+
+//initialize firebase admin
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
 
 
 const app = express();
+app.set("trust proxy", 1);
 const port = process.env.PORT || 3000;
 
 // --- CORS ---
 const corsOptions = {
-  origin: ["http://localhost:5173", "http://localhost:5174"],
+  origin: ["http://localhost:5173", "https://project-micromint.vercel.app"],
   credentials: true,
   optionsSuccessStatus: 200,
 };
@@ -35,7 +45,7 @@ const client = new MongoClient(uri, {
 const cookieOptions = {
   httpOnly: true,
   secure: process.env.NODE_ENV === "production",
-  sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+  sameSite: process.env.NODE_ENV === "production" ? "none" : "strict",
   maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
 };
 
@@ -55,6 +65,7 @@ const verifyToken = (req, res, next) => {
     next();
   });
 };
+
 
 async function run() {
   try {
@@ -76,7 +87,7 @@ async function run() {
         .clearCookie("token", {
           httpOnly: true,
           secure: process.env.NODE_ENV === "production",
-          sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+          sameSite: process.env.NODE_ENV === "production" ? "none" : "strict",
         })
         .send({ success: true });
     });
@@ -99,20 +110,30 @@ async function run() {
     const DEFAULT_COIN_WORKER = parseInt(process.env.DEFAULT_COIN_WORKER);
     const COIN_TO_DOLLAR_RATE = parseInt(process.env.COIN_TO_DOLLAR_RATE);
 
+    //verifyAdmin middleware
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.user?.email;
+      const query = { email: email };
+      const user = await usersCollection.findOne(query);
+      const isAdmin = user?.role === "admin";
+
+      if (!isAdmin)
+        return res.status(403).send({ message: "forbidden access " });
+      next();
+    };
 
     // Register and save user on db — form or google sign in
     app.post("/users", async (req, res) => {
       const { name, email, image, role, timezone } = req.body;
-      
+
       try {
         const isExist = await usersCollection.findOne({ email });
         if (isExist) return res.send(isExist);
 
         const allowedRoles = ["worker", "buyer"];
         const defaultRole = allowedRoles.includes(role) ? role : "worker";
-        const initialCoins = defaultRole === "buyer"
-          ? DEFAULT_COIN_BUYER
-          : DEFAULT_COIN_WORKER;
+        const initialCoins =
+          defaultRole === "buyer" ? DEFAULT_COIN_BUYER : DEFAULT_COIN_WORKER;
 
         const newUser = {
           name,
@@ -145,7 +166,6 @@ async function run() {
       const email = req.params.email;
 
       try {
-
         if (req.user.email !== email) {
           return res.status(403).send({ message: "Forbidden" });
         }
@@ -154,7 +174,6 @@ async function run() {
 
         if (!user) return res.status(404).send({ message: "User not found" });
         res.send(user);
-        
       } catch (error) {
         res.status(500).send({ message: "Failed to fetch user" });
       }
@@ -318,12 +337,35 @@ async function run() {
     //save add task to the tasks collection
     app.post("/tasks", verifyToken, async (req, res) => {
       const task = req.body;
-      const result = await taskCollection.insertOne(task);
-      res.send(result);
+      const buyerEmail = req.user.email;
+      const totalPayable = task.total_payable_amount;
+       
+      try {
+        const user = await usersCollection.findOne({ email: buyerEmail });
+
+        if (!user) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        //don't add task for insufficient coins
+        if (user.coins < totalPayable) {
+          return res.status(400).send({
+            message: `Insufficient coins. You need ${totalPayable} but have ${user.coins}.`,
+          });
+        }
+
+        //Save the task if balance is sufficient
+        const result = await taskCollection.insertOne(task);
+        res.send(result);
+
+      } catch (error) {
+        console.error("Task Creation Error:", error);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
     });
 
     //get all tasks
-    app.get("/tasks", verifyToken, async (req, res) => {
+    app.get("/tasks", async (req, res) => {
       const result = await taskCollection.find().toArray();
       res.send(result);
     });
@@ -462,6 +504,45 @@ async function run() {
           .send({ message: "Failed to update task due to a server error" });
       }
     });
+
+    //delete the added task
+    app.delete("/tasks/:id", verifyToken, async(req, res) => {
+      const id = req.params.id;
+      const buyerEmail = req.params.email;
+
+      try {
+        const task = await taskCollection.findOne({ _id: new ObjectId(id)});
+        if(!task) {
+          return res.status(404).send({ message: "Task not found" })
+        } 
+        if(task.buyer.email !== buyerEmail){
+          return res.status(403).send({ messgae: "Forbidden: You don't own this task"})
+        }
+
+        await submittedTasksCollection.updateMany(
+          {
+            task_id: id,
+            status: { $in: ["pending", "rejected"] }
+          },
+          {
+            $set: {
+              status: "cancelled by buyer",
+              cancelledAt: new Date(),
+            }
+          }
+        );
+
+        const result = await taskCollection.deleteOne({ _id: new ObjectId(id) });
+        res.send({
+          success: true,
+          message: "Task removed successfully. Worker submission history preserved."
+        })
+
+      } catch (error) {
+        console.error("Delete Task Error:", error);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    })
 
     //save submitted_tasks on the database also patch i.e., update task workers
     app.post("/submitted-task", verifyToken, async (req, res) => {
@@ -892,12 +973,17 @@ async function run() {
         } = withdrawalData;
 
         // Validation
-        if (!worker_name || !withdrawal_coin || !payment_system || !account_number) {
+        if (
+          !worker_name ||
+          !withdrawal_coin ||
+          !payment_system ||
+          !account_number
+        ) {
           return res.status(400).send({ message: "All fields are required" });
         }
 
         const requestedCoins = Number(withdrawal_coin);
-        
+
         // Check against .env Minimum
         if (requestedCoins < MIN_WITHDRAW_COINS) {
           return res.status(400).send({
@@ -906,7 +992,10 @@ async function run() {
         }
 
         await session.withTransaction(async () => {
-          const user = await usersCollection.findOne({ email: workerEmail }, { session });
+          const user = await usersCollection.findOne(
+            { email: workerEmail },
+            { session },
+          );
 
           if (!user || user.coins < requestedCoins) {
             throw new Error("Insufficient balance or user not found");
@@ -924,36 +1013,45 @@ async function run() {
           };
 
           // 1. Create Withdrawal Record
-          const result = await withdrawalsCollection.insertOne(withdrawalDoc, { session });
+          const result = await withdrawalsCollection.insertOne(withdrawalDoc, {
+            session,
+          });
 
           // 2. Deduct Coins from User
           await usersCollection.updateOne(
             { email: workerEmail },
             { $inc: { coins: -requestedCoins } },
-            { session }
+            { session },
           );
 
           // 3. Create Transaction Ledger
-          await transactionsCollection.insertOne({
-            receiver_email: workerEmail,
-            amount: requestedCoins,
-            type: "withdrawal",
-            status: "pending",
-            description: `Withdrawal via ${payment_system}`,
-            withdrawal_id: result.insertedId,
-            timestamp: new Date(),
-          }, { session });
+          await transactionsCollection.insertOne(
+            {
+              receiver_email: workerEmail,
+              amount: requestedCoins,
+              type: "withdrawal",
+              status: "pending",
+              description: `Withdrawal via ${payment_system}`,
+              withdrawal_id: result.insertedId,
+              timestamp: new Date(),
+            },
+            { session },
+          );
         });
 
         res.status(201).send({
           success: true,
           message: "Withdrawal request submitted successfully",
         });
-
       } catch (error) {
         console.error("Withdrawal Error:", error);
-        const status = error.message === "Insufficient balance or user not found" ? 400 : 500;
-        res.status(status).send({ message: error.message || "Failed to process withdrawal" });
+        const status =
+          error.message === "Insufficient balance or user not found"
+            ? 400
+            : 500;
+        res
+          .status(status)
+          .send({ message: error.message || "Failed to process withdrawal" });
       } finally {
         await session.endSession();
       }
@@ -1036,7 +1134,7 @@ async function run() {
         // We use .find() to get all packages and sort them by coin amount (ascending)
         const result = await packagesCollection
           .find()
-          .sort({ coins: 1 }) 
+          .sort({ coins: 1 })
           .toArray();
 
         res.send(result);
@@ -1060,52 +1158,55 @@ async function run() {
         const startOfDay = userNow.startOf("day").toJSDate();
         const startOfMonth = userNow.startOf("month").toJSDate();
 
-        const statsArray = await transactionsCollection.aggregate([
-          { 
-            $match: { 
-              email: userEmail, 
-              type: "purchase", 
-              timestamp: { $gte: startOfMonth } 
-            } 
-          },
-          {
-            $group: {
-              _id: null,
-              monthlyTotal: { $sum: "$coins" },
-              dailyTotal: { 
-                $sum: { 
-                  $cond: [{ $gte: ["$timestamp", startOfDay] }, "$coins", 0] 
-                } 
-              }
-            }
-          }
-        ]).toArray();
+        const statsArray = await transactionsCollection
+          .aggregate([
+            {
+              $match: {
+                email: userEmail,
+                type: "purchase",
+                timestamp: { $gte: startOfMonth },
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                monthlyTotal: { $sum: "$coins" },
+                dailyTotal: {
+                  $sum: {
+                    $cond: [{ $gte: ["$timestamp", startOfDay] }, "$coins", 0],
+                  },
+                },
+              },
+            },
+          ])
+          .toArray();
 
         const stats = statsArray[0] || { dailyTotal: 0, monthlyTotal: 0 };
 
         // Calculate time until the next local midnight
         const nextReset = userNow.plus({ days: 1 }).startOf("day");
-        const timeLeft = nextReset.diff(userNow, ['hours', 'minutes']).toObject();
+        const timeLeft = nextReset
+          .diff(userNow, ["hours", "minutes"])
+          .toObject();
 
         res.send({
           usage: {
             daily: stats.dailyTotal,
-            monthly: stats.monthlyTotal
+            monthly: stats.monthlyTotal,
           },
           remaining: {
             daily: Math.max(0, DAILY_COIN_LIMIT - stats.dailyTotal),
-            monthly: Math.max(0, MONTHLY_COIN_LIMIT - stats.monthlyTotal)
+            monthly: Math.max(0, MONTHLY_COIN_LIMIT - stats.monthlyTotal),
           },
           limits: {
             daily: DAILY_COIN_LIMIT,
-            monthly: MONTHLY_COIN_LIMIT
+            monthly: MONTHLY_COIN_LIMIT,
           },
           resetIn: {
             hours: Math.floor(timeLeft.hours),
-            minutes: Math.floor(timeLeft.minutes)
-          }
+            minutes: Math.floor(timeLeft.minutes),
+          },
         });
-
       } catch (error) {
         console.error("Stats Error:", error);
         res.status(500).send({ message: "Failed to load purchase statistics" });
@@ -1171,13 +1272,17 @@ async function run() {
         if (daily + pkg.coins > DAILY_COIN_LIMIT) {
           return res
             .status(429)
-            .send({ message: `Daily limit of ${DAILY_COIN_LIMIT} coins exceeded.` });
+            .send({
+              message: `Daily limit of ${DAILY_COIN_LIMIT} coins exceeded.`,
+            });
         }
         //monthly limit
         if (monthly + pkg.coins > MONTHLY_COIN_LIMIT) {
           return res
             .status(429)
-            .send({ message: `Monthly limit of ${MONTHLY_COIN_LIMIT} coins exceeded.` });
+            .send({
+              message: `Monthly limit of ${MONTHLY_COIN_LIMIT} coins exceeded.`,
+            });
         }
 
         // save transactions on collection
@@ -1214,13 +1319,11 @@ async function run() {
       }
     });
 
-
-  //Fetches all approved payouts made by a specific buyer to workers
+    //Fetches all approved payouts made by a specific buyer to workers
     app.get("/buyer-payments/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
 
       try {
-        
         if (req.user.email !== email) {
           return res.status(403).send({ message: "Forbidden Access" });
         }
@@ -1240,7 +1343,7 @@ async function run() {
         res.status(500).send({ message: "Failed to fetch payment history" });
       }
     });
-    
+
     // await client.connect();
 
     console.log("Connected to MongoDB!");
