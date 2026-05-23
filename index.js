@@ -3,7 +3,6 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-require('@dotenvx/dotenvx').config();
 const { DateTime } = require("luxon");
 const admin = require("firebase-admin");
 
@@ -11,9 +10,8 @@ const admin = require("firebase-admin");
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(serviceAccount),
 });
-
 
 const app = express();
 app.set("trust proxy", 1);
@@ -21,7 +19,11 @@ const port = process.env.PORT || 3000;
 
 // --- CORS ---
 const corsOptions = {
-  origin: ["http://localhost:5173", "https://project-micromint.vercel.app"],
+  origin: [
+    "http://localhost:5173",
+    "https://project-micromint.vercel.app",
+    "https://micromint-2025.web.app",
+  ],
   credentials: true,
   optionsSuccessStatus: 200,
 };
@@ -48,24 +50,6 @@ const cookieOptions = {
   sameSite: process.env.NODE_ENV === "production" ? "none" : "strict",
   maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
 };
-
-// --- VERIFY TOKEN MIDDLEWARE ---
-const verifyToken = (req, res, next) => {
-  const token = req.cookies?.token;
-  if (!token) {
-    return res.status(401).send({ message: "Unauthorized: No token" });
-  }
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res
-        .status(401)
-        .send({ message: "Unauthorized: Invalid or expired token" });
-    }
-    req.user = decoded;
-    next();
-  });
-};
-
 
 async function run() {
   try {
@@ -109,6 +93,26 @@ async function run() {
     const DEFAULT_COIN_BUYER = parseInt(process.env.DEFAULT_COIN_BUYER);
     const DEFAULT_COIN_WORKER = parseInt(process.env.DEFAULT_COIN_WORKER);
     const COIN_TO_DOLLAR_RATE = parseInt(process.env.COIN_TO_DOLLAR_RATE);
+    const WITHDRAW_COIN_TO_DOLLAR_RATE = parseInt(
+      process.env.WITHDRAW_COIN_TO_DOLLAR_RATE,
+    );
+
+    // --- VERIFY TOKEN MIDDLEWARE ---
+    const verifyToken = (req, res, next) => {
+      const token = req.cookies?.token;
+      if (!token) {
+        return res.status(401).send({ message: "Unauthorized: No token" });
+      }
+      jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+        if (err) {
+          return res
+            .status(401)
+            .send({ message: "Unauthorized: Invalid or expired token" });
+        }
+        req.user = decoded;
+        next();
+      });
+    };
 
     //verifyAdmin middleware
     const verifyAdmin = async (req, res, next) => {
@@ -179,6 +183,144 @@ async function run() {
       }
     });
 
+    // User delete route from firebase and database
+    app.delete("/users/:email", verifyToken, verifyAdmin, async (req, res) => {
+      const email = req.params.email;
+      const session = client.startSession();
+
+      try {
+        // Verify user exists
+        const user = await usersCollection.findOne({ email });
+        if (!user) {
+          return res
+            .status(404)
+            .send({ message: "User not found in database" });
+        }
+
+        // Prevent admin from deleting their own account
+        if (email === req.user.email) {
+          return res
+            .status(403)
+            .send({ message: "Admins cannot delete their own account" });
+        }
+
+        // Delete from Firebase Authentication first 
+        try {
+          const firebaseUser = await admin.auth().getUserByEmail(email);
+          await admin.auth().deleteUser(firebaseUser.uid);
+        } catch (firebaseError) {
+          if (firebaseError.code === "auth/user-not-found") {
+            console.warn(
+              `User ${email} already missing from Firebase Authentication.`,
+            );
+          } else {
+            console.error("Firebase deletion error:", firebaseError.message);
+            return res
+              .status(500)
+              .send({
+                message: "Failed to delete user from authentication provider",
+              });
+          }
+        }
+
+        // Execute all DB operations atomically
+        await session.withTransaction(async () => {
+          //delete main user profile
+          await usersCollection.deleteOne({ email }, { session });
+
+          //clear pending/resolved role change requests
+          await roleRequestsCollection.deleteMany({ email }, { session });
+
+          // --- BUYER CLEANUP ---
+          if (user.role === "buyer") {
+            const buyerTasks = await taskCollection
+              .find({ "buyer.email": email }, { session })
+              .toArray();
+            const taskIds = buyerTasks.map((t) => t._id.toString());
+
+            // Delete all tasks posted by this buyer
+            await taskCollection.deleteMany(
+              { "buyer.email": email },
+              { session },
+            );
+
+            if (taskIds.length > 0) {
+              // Mark pending/rejected worker submissions as cancelled so workers
+              // can see why the task disappeared from their dashboard
+              await submittedTasksCollection.updateMany(
+                {
+                  task_id: { $in: taskIds },
+                  status: { $in: ["pending", "rejected"] },
+                },
+                {
+                  $set: {
+                    status: "cancelled account deleted",
+                    cancelledAt: new Date(),
+                  },
+                },
+                { session },
+              );
+
+              // Hard delete approved submissions — coins already paid out, no longer actionable
+              // NOTE: Workers keep their earned coins. Buyer's coins were already deducted. No reversal needed.
+              await submittedTasksCollection.deleteMany(
+                { task_id: { $in: taskIds }, status: "approved" },
+                { session },
+              );
+            }
+          }
+
+          // --- WORKER CLEANUP ---
+          if (user.role === "worker") {
+            // Refund task slots for pending submissions before deleting them
+            // so those tasks remain available for other workers
+            const pendingSubmissions = await submittedTasksCollection
+              .find({ "worker.email": email, status: "pending" }, { session })
+              .toArray();
+
+            for (const sub of pendingSubmissions) {
+              await taskCollection.updateOne(
+                { _id: new ObjectId(sub.task_id) },
+                { $inc: { required_workers: 1 } },
+                { session },
+              );
+            }
+
+            // Delete all submissions by this worker
+            // NOTE: Approved submissions already paid — buyer coins deducted, worker coins on deleted profile. No reversal needed.
+            await submittedTasksCollection.deleteMany(
+              { "worker.email": email },
+              { session },
+            );
+
+            // Cancel pending withdrawals only — keep approved/rejected as financial audit trail
+            await withdrawalsCollection.updateMany(
+              { worker_email: email, status: "pending" },
+              {
+                $set: {
+                  status: "cancelled_account_deleted",
+                  cancelledAt: new Date(),
+                },
+              },
+              { session },
+            );
+          }
+        });
+
+        res.send({
+          success: true,
+          message: `User ${email} and all associated data has been completely removed.`,
+        });
+      } catch (error) {
+        console.error("Cascading Delete User Error:", error);
+        res
+          .status(500)
+          .send({ message: "Internal server error during full data wipeout" });
+      } finally {
+        await session.endSession();
+      }
+    });
+
     // Update name and image only — no role
     app.patch("/users/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
@@ -202,6 +344,7 @@ async function run() {
           return res.status(400).send({ message: "No valid fields to update" });
         }
 
+        updateFields.updatedAt = new Date();
         await usersCollection.updateOne({ email }, { $set: updateFields });
 
         const updatedUser = await usersCollection.findOne({ email });
@@ -325,6 +468,7 @@ async function run() {
       }
     });
 
+    //get all users from database
     app.get("/users", verifyToken, async (req, res) => {
       try {
         const result = await usersCollection.find().toArray();
@@ -339,25 +483,52 @@ async function run() {
       const task = req.body;
       const buyerEmail = req.user.email;
       const totalPayable = task.total_payable_amount;
-       
+
       try {
         const user = await usersCollection.findOne({ email: buyerEmail });
-
         if (!user) {
           return res.status(404).send({ message: "User not found" });
         }
 
-        //don't add task for insufficient coins
-        if (user.coins < totalPayable) {
+        // 1. Get total committed coins from ACTIVE tasks only (not completed/cancelled)
+        //    This reduces the number of documents scanned and makes business logic correct.
+        const commitmentStats = await taskCollection
+          .aggregate([
+            {
+              $match: {
+                "buyer.email": buyerEmail,
+                status: { $in: ["open", "in-progress", "pending"] }, // adjust to your actual statuses
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                totalCommitted: {
+                  $sum: { $multiply: ["$required_workers", "$payable_amount"] },
+                },
+              },
+            },
+            // Optional: project only needed fields to reduce data transfer (covered query)
+            { $project: { totalCommitted: 1, _id: 0 } },
+          ])
+          .toArray();
+
+        const totalCommitted = commitmentStats[0]?.totalCommitted ?? 0;
+        const virtuallyAvailable = user.coins - totalCommitted;
+
+        if (virtuallyAvailable < totalPayable) {
           return res.status(400).send({
-            message: `Insufficient coins. You need ${totalPayable} but have ${user.coins}.`,
+            message: `Insufficient balance. You have ${user.coins} coins total, ${totalCommitted} locked in active tasks. Only ${virtuallyAvailable} available, but this task requires ${totalPayable}.`,
           });
         }
 
-        //Save the task if balance is sufficient
-        const result = await taskCollection.insertOne(task);
+        const taskDoc = {
+          ...task,
+          createdAt: new Date(),
+          status: "open",
+        };
+        const result = await taskCollection.insertOne(taskDoc);
         res.send(result);
-
       } catch (error) {
         console.error("Task Creation Error:", error);
         res.status(500).send({ message: "Internal Server Error" });
@@ -365,7 +536,7 @@ async function run() {
     });
 
     //get all tasks
-    app.get("/tasks", async (req, res) => {
+    app.get("/tasks", verifyToken, async (req, res) => {
       const result = await taskCollection.find().toArray();
       res.send(result);
     });
@@ -505,44 +676,70 @@ async function run() {
       }
     });
 
-    //delete the added task
-    app.delete("/tasks/:id", verifyToken, async(req, res) => {
+    // delete the added task (Accessible by Buyer Owner or Admin)
+    app.delete("/tasks/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
-      const buyerEmail = req.params.email;
+      //requested user email from jwt
+      const email = req.user?.email;
+
+      if (!email) {
+        return res
+          .status(401)
+          .send({ message: "Unauthorized: Missing user email" });
+      }
 
       try {
-        const task = await taskCollection.findOne({ _id: new ObjectId(id)});
-        if(!task) {
-          return res.status(404).send({ message: "Task not found" })
-        } 
-        if(task.buyer.email !== buyerEmail){
-          return res.status(403).send({ messgae: "Forbidden: You don't own this task"})
+        // Fetch the user's role from database
+        const user = await usersCollection.findOne({ email: email });
+        const role = user?.role;
+
+        // Fetch the task to check ownership
+        const task = await taskCollection.findOne({ _id: new ObjectId(id) });
+        if (!task) {
+          return res.status(404).send({ message: "Task not found" });
         }
 
+        //check user is admin or added buyer himself
+        const isAdmin = role === "admin";
+        const isOwner = task.buyer.email === email;
+
+        if (!isAdmin && !isOwner) {
+          return res
+            .status(403)
+            .send({
+              message:
+                "Forbidden: You don't have permission to delete this task",
+            });
+        }
+
+        //Update worker submissions related to this task
         await submittedTasksCollection.updateMany(
           {
             task_id: id,
-            status: { $in: ["pending", "rejected"] }
+            status: { $in: ["pending", "rejected"] },
           },
           {
             $set: {
-              status: "cancelled by buyer",
+              status: isAdmin ? "cancelled by admin" : "cancelled by buyer",
               cancelledAt: new Date(),
-            }
-          }
+            },
+          },
         );
 
-        const result = await taskCollection.deleteOne({ _id: new ObjectId(id) });
+        //Delete the actual task
+        await taskCollection.deleteOne({ _id: new ObjectId(id) });
+
         res.send({
           success: true,
-          message: "Task removed successfully. Worker submission history preserved."
-        })
-
+          message: isAdmin
+            ? "Task removed by Admin successfully. Worker submission history updated."
+            : "Task removed successfully. Worker submission history preserved.",
+        });
       } catch (error) {
         console.error("Delete Task Error:", error);
         res.status(500).send({ message: "Internal Server Error" });
       }
-    })
+    });
 
     //save submitted_tasks on the database also patch i.e., update task workers
     app.post("/submitted-task", verifyToken, async (req, res) => {
@@ -584,17 +781,15 @@ async function run() {
         }
 
         // Check if this is a re-submission
-        const prevRejected = await submittedTasksCollection.findOne({
+        const previousSubmission = await submittedTasksCollection.findOne({
           task_id: task_id,
           "worker.email": worker_email,
-          status: "rejected",
+          status: { $in: ["rejected", "revision_requested"] }
         });
 
         // Check worker availability
-        if (!prevRejected && task.required_workers <= 0) {
-          return res
-            .status(400)
-            .send({ message: "Task is no longer available (slots full)." });
+        if (!previousSubmission && task.required_workers <= 0) {
+          return res.status(400).send({ message: "No slots available" });
         }
 
         // Create and Upsert Submission
@@ -606,6 +801,7 @@ async function run() {
           submission_details: submission_details,
           buyer: { name: task.buyer.name, email: task.buyer.email },
           current_date: today,
+          submittedAt: new Date(),
           status: "pending",
         };
 
@@ -616,10 +812,11 @@ async function run() {
         );
 
         // Only decrease slot if this is worker's first attempt
-        if (!prevRejected) {
+        if (!previousSubmission) {
+          // first time submitting -> occupy a slot
           await taskCollection.updateOne(
             { _id: new ObjectId(task_id) },
-            { $inc: { required_workers: -1 } },
+            { $inc: { required_workers: -1 } }
           );
         }
 
@@ -663,7 +860,7 @@ async function run() {
 
       try {
         // validation of unknown status
-        if (!["approved", "rejected"].includes(action)) {
+        if (!["approved", "rejected", "request_revision"].includes(action)) {
           return res.status(400).send({ message: "Invalid action" });
         }
 
@@ -721,6 +918,15 @@ async function run() {
           });
         }
 
+        if (action === "request_revision") {
+          await submittedTasksCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { status: "revision_requested", reviewedAt: new Date() } }
+          );
+          // Do NOT deduct buyer coins, do NOT pay worker, do NOT refund slot
+          return res.send({ success: true, message: "Revision requested" });
+        }
+
         res.send({ success: true });
       } catch (error) {
         console.error("Review error:", error);
@@ -728,36 +934,9 @@ async function run() {
       }
     });
 
-    //delete or cancel submitted task
-    app.delete("/submitted-task/:id", verifyToken, async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-
-      const submission = await submittedTasksCollection.findOne(query);
-
-      // 1. Check if submission exists and is still pending
-      if (submission && submission.status.toLowerCase() === "pending") {
-        // 2. Delete the submission
-        const result = await submittedTasksCollection.deleteOne(query);
-
-        // 3. Refund the worker slot to the task
-        await taskCollection.updateOne(
-          { _id: new ObjectId(submission.task_id) },
-          { $inc: { required_workers: 1 } },
-        );
-        res.send(result);
-      } else {
-        res.send({ error: "Action not allowed or record not found" });
-      }
-    });
-
     //get worker stats
     app.get("/worker-stats/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
-
-      //coin to dollar rate
-      const COIN_TO_DOLLAR_RATE = parseInt(process.env.COIN_TO_DOLLAR_RATE);
-
       if (req.user.email !== email) {
         return res.status(403).send({ message: "Forbidden Access" });
       }
@@ -771,7 +950,7 @@ async function run() {
                 _id: null,
                 totalSubmissions: { $sum: 1 },
                 totalPendingSubmissions: {
-                  $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] },
+                  $sum: { $cond: [{ $eq: ["$status", ["pending", "revision_requested"]] }, 1, 0] },
                 },
                 // Sum payable_amount ONLY for approved tasks
                 totalEarnings: {
@@ -803,7 +982,10 @@ async function run() {
         } = stats[0] || {};
 
         const totalEarningsDollar =
-          Math.round((totalEarnings / COIN_TO_DOLLAR_RATE) * 100) / 100;
+          totalEarnings > 0
+            ? Math.floor((totalEarnings / WITHDRAW_COIN_TO_DOLLAR_RATE) * 100) /
+              100
+            : 0;
         res.send({
           totalSubmissions,
           totalPendingSubmissions,
@@ -983,6 +1165,7 @@ async function run() {
         }
 
         const requestedCoins = Number(withdrawal_coin);
+        const calculatedUSD = requestedCoins / WITHDRAW_COIN_TO_DOLLAR_RATE;
 
         // Check against .env Minimum
         if (requestedCoins < MIN_WITHDRAW_COINS) {
@@ -1005,7 +1188,7 @@ async function run() {
             worker_email: workerEmail,
             worker_name,
             withdrawal_coin: requestedCoins,
-            withdrawal_amount: Number(withdrawal_amount),
+            withdrawal_amount: calculatedUSD,
             payment_system,
             account_number,
             withdraw_date: new Date(),
@@ -1029,6 +1212,7 @@ async function run() {
             {
               receiver_email: workerEmail,
               amount: requestedCoins,
+              usd_value: calculatedUSD,
               type: "withdrawal",
               status: "pending",
               description: `Withdrawal via ${payment_system}`,
@@ -1270,19 +1454,15 @@ async function run() {
         // Limit Guard Clauses
         //daily limit
         if (daily + pkg.coins > DAILY_COIN_LIMIT) {
-          return res
-            .status(429)
-            .send({
-              message: `Daily limit of ${DAILY_COIN_LIMIT} coins exceeded.`,
-            });
+          return res.status(429).send({
+            message: `Daily limit of ${DAILY_COIN_LIMIT} coins exceeded.`,
+          });
         }
         //monthly limit
         if (monthly + pkg.coins > MONTHLY_COIN_LIMIT) {
-          return res
-            .status(429)
-            .send({
-              message: `Monthly limit of ${MONTHLY_COIN_LIMIT} coins exceeded.`,
-            });
+          return res.status(429).send({
+            message: `Monthly limit of ${MONTHLY_COIN_LIMIT} coins exceeded.`,
+          });
         }
 
         // save transactions on collection
