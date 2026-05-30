@@ -85,17 +85,16 @@ async function run() {
     const withdrawalsCollection = db.collection("withdrawals");
     const packagesCollection = db.collection("packages");
     const purchasesCollection = db.collection("purchases");
+    const notificationsCollection = db.collection("notifications");
 
-    //global variables
+    // global variables
     const MIN_WITHDRAW_COINS = parseInt(process.env.MIN_WITHDRAW_COINS);
     const DAILY_COIN_LIMIT = parseInt(process.env.DAILY_COIN_LIMIT);
     const MONTHLY_COIN_LIMIT = parseInt(process.env.MONTHLY_COIN_LIMIT);
     const DEFAULT_COIN_BUYER = parseInt(process.env.DEFAULT_COIN_BUYER);
     const DEFAULT_COIN_WORKER = parseInt(process.env.DEFAULT_COIN_WORKER);
     const COIN_TO_DOLLAR_RATE = parseInt(process.env.COIN_TO_DOLLAR_RATE);
-    const WITHDRAW_COIN_TO_DOLLAR_RATE = parseInt(
-      process.env.WITHDRAW_COIN_TO_DOLLAR_RATE,
-    );
+    const WITHDRAW_COIN_TO_DOLLAR_RATE = parseInt(process.env.WITHDRAW_COIN_TO_DOLLAR_RATE);
 
     // --- VERIFY TOKEN MIDDLEWARE ---
     const verifyToken = (req, res, next) => {
@@ -114,7 +113,7 @@ async function run() {
       });
     };
 
-    //verifyAdmin middleware
+    // verifyAdmin middleware
     const verifyAdmin = async (req, res, next) => {
       const email = req.user?.email;
       const query = { email: email };
@@ -126,30 +125,50 @@ async function run() {
       next();
     };
 
+    // helper function for notification
+    async function dispatchNotification({ to_email, title, message, type, action_route = null }, session = null) {
+      const notificationDoc = {
+        to_email,
+        title,
+        message,
+        type,
+        action_route,
+        isRead: false,
+        timestamp: new Date()
+      };
+      const options = session ? { session } : {};
+      return await notificationsCollection.insertOne(notificationDoc, options);
+    }
+
+
     // Register and save user on db — form or google sign in
     app.post("/users", async (req, res) => {
       const { name, email, image, role, timezone } = req.body;
 
       try {
+        // check if user already exists
         const isExist = await usersCollection.findOne({ email });
         if (isExist) return res.send(isExist);
 
+        // allow roles with default worker role and coins
         const allowedRoles = ["worker", "buyer"];
         const defaultRole = allowedRoles.includes(role) ? role : "worker";
-        const initialCoins =
-          defaultRole === "buyer" ? DEFAULT_COIN_BUYER : DEFAULT_COIN_WORKER;
+        const initialCoins = defaultRole === "buyer" ? DEFAULT_COIN_BUYER : DEFAULT_COIN_WORKER;
 
+        // new user data
         const newUser = {
           name,
           email,
           image,
           role: defaultRole,
           coins: initialCoins,
-          timezone: timezone, //add timezone to track user daily coin limti
+          timezone: timezone, // add timezone to track user daily coin limti
           timestamp: new Date(),
         };
 
         await usersCollection.insertOne(newUser);
+
+        // save coin transaction data
         await transactionsCollection.insertOne({
           receiver_email: email,
           amount: initialCoins,
@@ -157,6 +176,15 @@ async function run() {
           status: "completed",
           description: "Welcome Bonus",
           timestamp: new Date(),
+        });
+
+        // save data on notification
+        await dispatchNotification({
+          to_email: email,
+          title: "Welcome Bonus Credited!",
+          message: `Your MicroMint account is ready. We've credited ${initialCoins} coins to your balance as a welcome gift.`,
+          type: "system",
+          action_route: defaultRole === "buyer" ? "/dashboard/buyer-home" : "/dashboard/worker-home"
         });
 
         res.status(201).send(newUser);
@@ -168,14 +196,11 @@ async function run() {
     // Get user by email
     app.get("/users/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
-
       try {
         if (req.user.email !== email) {
           return res.status(403).send({ message: "Forbidden" });
         }
-
         const user = await usersCollection.findOne({ email });
-
         if (!user) return res.status(404).send({ message: "User not found" });
         res.send(user);
       } catch (error) {
@@ -189,22 +214,17 @@ async function run() {
       const session = client.startSession();
 
       try {
-        // Verify user exists
         const user = await usersCollection.findOne({ email });
         if (!user) {
-          return res
-            .status(404)
-            .send({ message: "User not found in database" });
+          return res.status(404).send({ message: "User not found in database" });
         }
 
-        // Prevent admin from deleting their own account
+        // prevent admin from deleting their own account
         if (email === req.user.email) {
-          return res
-            .status(403)
-            .send({ message: "Admins cannot delete their own account" });
+          return res.status(403).send({ message: "Admins cannot delete their own account" });
         }
 
-        // Delete from Firebase Authentication first 
+        // delete from Firebase Authentication first 
         try {
           const firebaseUser = await admin.auth().getUserByEmail(email);
           await admin.auth().deleteUser(firebaseUser.uid);
@@ -225,28 +245,29 @@ async function run() {
 
         // Execute all DB operations atomically
         await session.withTransaction(async () => {
-          //delete main user profile
+
+          // delete main user profile
           await usersCollection.deleteOne({ email }, { session });
 
-          //clear pending/resolved role change requests
+          // clear pending/resolved role change requests
           await roleRequestsCollection.deleteMany({ email }, { session });
 
-          // --- BUYER CLEANUP ---
+          // buyer cleanup
           if (user.role === "buyer") {
             const buyerTasks = await taskCollection
               .find({ "buyer.email": email }, { session })
               .toArray();
             const taskIds = buyerTasks.map((t) => t._id.toString());
 
-            // Delete all tasks posted by this buyer
+            // delete all tasks posted by this buyer
             await taskCollection.deleteMany(
               { "buyer.email": email },
               { session },
             );
 
             if (taskIds.length > 0) {
-              // Mark pending/rejected worker submissions as cancelled so workers
-              // can see why the task disappeared from their dashboard
+
+              // mark pending/rejected worker submissions as cancelled
               await submittedTasksCollection.updateMany(
                 {
                   task_id: { $in: taskIds },
@@ -261,19 +282,27 @@ async function run() {
                 { session },
               );
 
-              // Hard delete approved submissions — coins already paid out, no longer actionable
-              // NOTE: Workers keep their earned coins. Buyer's coins were already deducted. No reversal needed.
               await submittedTasksCollection.deleteMany(
                 { task_id: { $in: taskIds }, status: "approved" },
                 { session },
               );
+
+              for (const sub of affectedSubmissions) {
+                await dispatchNotification({
+                  to_email: sub.worker.email,
+                  title: "Task Cancelled (Account Purged)",
+                  message: `The task "${sub.task_title}" was closed because the buyer's account was deleted by administration.`,
+                  type: "task_lifecycle",
+                  action_route: "/dashboard/worker-submissions"
+                }, session);
+              }
             }
           }
 
-          // --- WORKER CLEANUP ---
+          // worker cleanup
           if (user.role === "worker") {
-            // Refund task slots for pending submissions before deleting them
-            // so those tasks remain available for other workers
+
+            // refund task slots for pending submissions before deleting them
             const pendingSubmissions = await submittedTasksCollection
               .find({ "worker.email": email, status: "pending" }, { session })
               .toArray();
@@ -284,16 +313,24 @@ async function run() {
                 { $inc: { required_workers: 1 } },
                 { session },
               );
+
+              // notify affected buyer for worker account removal
+              await dispatchNotification({
+                to_email: sub.buyer.email,
+                title: "Task Slot Restored",
+                message: `A submission for "${sub.task_title}" was dropped and the slot was returned because the worker's account was deleted.`,
+                type: "task_lifecycle",
+                action_route: `/dashboard/tasks/buyer/${sub.buyer.email}`
+              }, session);
             }
 
-            // Delete all submissions by this worker
-            // NOTE: Approved submissions already paid — buyer coins deducted, worker coins on deleted profile. No reversal needed.
+            // delete all submissions by this worker
             await submittedTasksCollection.deleteMany(
               { "worker.email": email },
               { session },
             );
 
-            // Cancel pending withdrawals only — keep approved/rejected as financial audit trail
+            // cancel pending withdrawals only
             await withdrawalsCollection.updateMany(
               { worker_email: email, status: "pending" },
               {
@@ -313,9 +350,7 @@ async function run() {
         });
       } catch (error) {
         console.error("Cascading Delete User Error:", error);
-        res
-          .status(500)
-          .send({ message: "Internal server error during full data wipeout" });
+        res.status(500).send({ message: "Internal server error during full data wipeout" });
       } finally {
         await session.endSession();
       }
@@ -327,6 +362,8 @@ async function run() {
       const { name, image } = req.body;
 
       try {
+
+        // only allow user himself
         if (req.user.email !== email) {
           return res.status(403).send({ message: "Forbidden" });
         }
@@ -336,6 +373,7 @@ async function run() {
           return res.status(404).send({ message: "User not found" });
         }
 
+        // update user name and profile picture
         const updateFields = {};
         if (name) updateFields.name = name;
         if (image) updateFields.image = image;
@@ -344,6 +382,7 @@ async function run() {
           return res.status(400).send({ message: "No valid fields to update" });
         }
 
+        //save updated user data with timestamp
         updateFields.updatedAt = new Date();
         await usersCollection.updateOne({ email }, { $set: updateFields });
 
@@ -360,14 +399,11 @@ async function run() {
       const { requestedRole } = req.body;
 
       try {
-        //Fetch current user to check their existing role
         const currentUser = await usersCollection.findOne({ email });
 
-        //Block request if the user is already an Admin
+        // block request if the user is already an Admin
         if (currentUser?.role === "admin") {
-          return res
-            .status(403)
-            .send({ message: "Admins cannot request role changes." });
+          return res.status(403).send({ message: "Admins cannot request role changes." });
         }
 
         const allowedRoles = ["worker", "buyer"];
@@ -381,9 +417,7 @@ async function run() {
         });
 
         if (existingRequest) {
-          return res
-            .status(409)
-            .send({ message: "You already have a pending request" });
+          return res.status(409).send({ message: "You already have a pending request" });
         }
 
         await roleRequestsCollection.insertOne({
@@ -462,14 +496,24 @@ async function run() {
           );
         }
 
+        // save role requrest data on notification
+        await dispatchNotification({
+          to_email: request.email,
+          title: status === "approved" ? "Role Change Approved!" : "Role Change Declined",
+          message: status === "approved" 
+            ? `Congratulations! Your request has been approved. You are now authorized as a ${request.requestedRole.toUpperCase()}.`
+            : `Your application to change your platform role to ${request.requestedRole} was rejected by administration.`,
+          type: "role_change",
+          action_route: "/"
+        });
         res.send({ success: true });
       } catch (error) {
         res.status(500).send({ message: "Failed to process request" });
       }
     });
 
-    //get all users from database
-    app.get("/users", verifyToken, async (req, res) => {
+    // Get all users from database
+    app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const result = await usersCollection.find().toArray();
         res.send(result);
@@ -478,7 +522,7 @@ async function run() {
       }
     });
 
-    //save add task to the tasks collection
+    // Save Add task to the tasks collection
     app.post("/tasks", verifyToken, async (req, res) => {
       const task = req.body;
       const buyerEmail = req.user.email;
@@ -490,14 +534,13 @@ async function run() {
           return res.status(404).send({ message: "User not found" });
         }
 
-        // 1. Get total committed coins from ACTIVE tasks only (not completed/cancelled)
-        //    This reduces the number of documents scanned and makes business logic correct.
+        // get total committed coins from ACTIVE tasks only (not completed/cancelled)
         const commitmentStats = await taskCollection
           .aggregate([
             {
               $match: {
                 "buyer.email": buyerEmail,
-                status: { $in: ["open", "in-progress", "pending"] }, // adjust to your actual statuses
+                status: { $in: ["open", "in-progress", "pending"] },
               },
             },
             {
@@ -508,7 +551,6 @@ async function run() {
                 },
               },
             },
-            // Optional: project only needed fields to reduce data transfer (covered query)
             { $project: { totalCommitted: 1, _id: 0 } },
           ])
           .toArray();
@@ -535,13 +577,13 @@ async function run() {
       }
     });
 
-    //get all tasks
+    // Get all tasks
     app.get("/tasks", verifyToken, async (req, res) => {
       const result = await taskCollection.find().toArray();
       res.send(result);
     });
 
-    //get tasks data by email for buyer
+    // Get tasks data by email for buyer
     app.get("/tasks/buyer/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
       const query = { "buyer.email": email };
@@ -549,11 +591,13 @@ async function run() {
       res.send(result);
     });
 
-    //get a specific task by id and also check whether worker submitted
+    // Get a specific task by id and also check whether task is submitted
     app.get("/tasks/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
+
       const task = await taskCollection.findOne(query);
+
       if (!task) return res.status(404).send({ message: "Task not found" });
 
       const existingSubmittedTask = await submittedTasksCollection.findOne({
@@ -568,7 +612,7 @@ async function run() {
       });
     });
 
-    //update task info buyer
+    // Update task info buyer
     app.patch("/tasks/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
       const buyerEmail = req.user.email;
@@ -616,7 +660,7 @@ async function run() {
           }
         }
 
-        // Logic: required_workers from frontend represents the NEW TOTAL target
+        // check required_workers
         if (required_workers !== undefined) {
           const newTotalWorkers = Number(required_workers);
           if (newTotalWorkers < activeSubmissions) {
@@ -624,10 +668,10 @@ async function run() {
               `Total workers cannot be less than active submissions (${activeSubmissions})`,
             );
           } else {
-            // We store the "remaining slots" in required_workers
+            // Store the "remaining slots" in required_workers
             updateFields.required_workers = newTotalWorkers - activeSubmissions;
 
-            // Recalculate total escrow/payable amount
+            // recalculate total payable amount
             const price =
               payable_amount !== undefined
                 ? Number(payable_amount)
@@ -642,7 +686,7 @@ async function run() {
           } else {
             updateFields.payable_amount = newPrice;
 
-            // If workers weren't updated in this request, recalculate total based on existing total target
+            // if workers weren't updated in this request, recalculate total based on existing total target
             if (required_workers === undefined) {
               const currentTotalWorkers =
                 Number(task.required_workers) + activeSubmissions;
@@ -664,6 +708,20 @@ async function run() {
           { $set: updateFields },
         );
 
+        // add on notifications after update task
+        if (payable_amount || task_detail || submission_info) {
+          const affectedWorkers = await submittedTasksCollection.distinct("worker.email", { task_id: id });
+          for (const workerEmail of affectedWorkers) {
+            await dispatchNotification({
+              to_email: workerEmail,
+              title: "Task Modified by Buyer",
+              message: `The parameters for your submitted/tracked task "${task.task_title}" have been updated. Review the terms.`,
+              type: "task_lifecycle",
+              action_route: "/dashboard/worker-submissions"
+            });
+          }
+        }
+
         const updatedTask = await taskCollection.findOne({
           _id: new ObjectId(id),
         });
@@ -676,10 +734,10 @@ async function run() {
       }
     });
 
-    // delete the added task (Accessible by Buyer Owner or Admin)
+    // Delete the added task (Accessible by Buyer Owner or Admin)
     app.delete("/tasks/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
-      //requested user email from jwt
+      // requested user email from jwt
       const email = req.user?.email;
 
       if (!email) {
@@ -689,17 +747,17 @@ async function run() {
       }
 
       try {
-        // Fetch the user's role from database
+        // fetch the user's role from database
         const user = await usersCollection.findOne({ email: email });
         const role = user?.role;
 
-        // Fetch the task to check ownership
+        // fetch the task to check ownership
         const task = await taskCollection.findOne({ _id: new ObjectId(id) });
         if (!task) {
           return res.status(404).send({ message: "Task not found" });
         }
 
-        //check user is admin or added buyer himself
+        // check user is admin or added buyer himself
         const isAdmin = role === "admin";
         const isOwner = task.buyer.email === email;
 
@@ -712,7 +770,7 @@ async function run() {
             });
         }
 
-        //Update worker submissions related to this task
+        // update worker submissions related to this task
         await submittedTasksCollection.updateMany(
           {
             task_id: id,
@@ -726,8 +784,21 @@ async function run() {
           },
         );
 
-        //Delete the actual task
+        // delete the actual task
         await taskCollection.deleteOne({ _id: new ObjectId(id) });
+
+        // dispatch system alerts to workers
+        for (const sub of pendingSubmissions) {
+          await dispatchNotification({
+            to_email: sub.worker.email,
+            title: isAdmin ? "Task Removed by Admin" : "Task Cancelled by Buyer",
+            message: isAdmin 
+              ? `The task "${task.task_title}" was force-removed by administration for platform compliance violations.`
+              : `The buyer has retracted the task campaign "${task.task_title}". Your submission has been dropped.`,
+            type: "task_lifecycle",
+            action_route: "/dashboard/worker-submissions"
+          });
+        }
 
         res.send({
           success: true,
@@ -741,13 +812,12 @@ async function run() {
       }
     });
 
-    //save submitted_tasks on the database also patch i.e., update task workers
+    // Save submitted_tasks on the database with patch i.e., update task workers
     app.post("/submitted-task", verifyToken, async (req, res) => {
-      const { task_id, submission_details, worker_email, worker_name } =
-        req.body;
+      const { task_id, submission_details, worker_email, worker_name } = req.body;
 
       try {
-        // Existing check for pending/approved submissions
+        // existing check for pending/approved submissions
         const activeSubmission = await submittedTasksCollection.findOne({
           task_id: task_id,
           "worker.email": worker_email,
@@ -760,7 +830,7 @@ async function run() {
           });
         }
 
-        // Fetch the task to check slots and deadline
+        // fetch the task to check slots and deadline
         const task = await taskCollection.findOne({
           _id: new ObjectId(task_id),
         });
@@ -769,7 +839,7 @@ async function run() {
           return res.status(404).send({ message: "Task not found." });
         }
 
-        // Deadline check in YYYY-MM-DD format
+        // deadline check in YYYY-MM-DD format
         const today = new Date().toISOString().slice(0, 10);
         const deadline = task.completion_date.slice(0, 10);
 
@@ -780,19 +850,19 @@ async function run() {
           });
         }
 
-        // Check if this is a re-submission
+        // check for task re-submission
         const previousSubmission = await submittedTasksCollection.findOne({
           task_id: task_id,
           "worker.email": worker_email,
           status: { $in: ["rejected", "revision_requested"] }
         });
 
-        // Check worker availability
+        // check worker availability
         if (!previousSubmission && task.required_workers <= 0) {
           return res.status(400).send({ message: "No slots available" });
         }
 
-        // Create and Upsert Submission
+        // create and upsert submission
         const newSubmission = {
           task_id: task_id,
           task_title: task.task_title,
@@ -811,14 +881,22 @@ async function run() {
           { upsert: true },
         );
 
-        // Only decrease slot if this is worker's first attempt
+        // only decrease slot for worker's first attempt
         if (!previousSubmission) {
-          // first time submitting -> occupy a slot
           await taskCollection.updateOne(
             { _id: new ObjectId(task_id) },
             { $inc: { required_workers: -1 } }
           );
         }
+
+        // dispatch buyer alerts for inbound work
+        await dispatchNotification({
+          to_email: task.buyer.email,
+          title: previousSubmission ? "Task Re-submitted" : "New Task Submission Incoming",
+          message: `${worker_name} has ${previousSubmission ? "revised and re-submitted" : "submitted work for"} your task: "${task.task_title}".`,
+          type: "task_lifecycle",
+          action_route: `/dashboard/submitted-task/buyer/${task.buyer.email}`
+        });
 
         res.send(result);
       } catch (error) {
@@ -827,7 +905,7 @@ async function run() {
       }
     });
 
-    //get all submitted tasks for a specific worker
+    // Get all submitted tasks for a specific worker
     app.get("/submitted-task/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
       const query = { "worker.email": email };
@@ -851,7 +929,7 @@ async function run() {
       }
     });
 
-    // Approve or reject a submission
+    // Update submitted task status
     app.patch("/submitted-task/:id/review", verifyToken, async (req, res) => {
       const id = req.params.id;
 
@@ -870,7 +948,7 @@ async function run() {
         if (!submission)
           return res.status(404).send({ message: "Submission not found" });
 
-        // Guard: only the task's buyer can review
+        // only the task's buyer can review
         if (submission.buyer.email !== req.user.email) {
           return res.status(403).send({ message: "Forbidden" });
         }
@@ -887,11 +965,20 @@ async function run() {
         );
 
         if (action === "rejected") {
-          // Refund the task slot
+          // refund the task slot
           await taskCollection.updateOne(
             { _id: new ObjectId(submission.task_id) },
             { $inc: { required_workers: 1 } },
           );
+
+          // notify worker rejection
+          await dispatchNotification({
+            to_email: submission.worker.email,
+            title: "Submission Declined",
+            message: `Your work for "${submission.task_title}" was rejected. Reason: ${feedback || "No additional comments left by buyer."}`,
+            type: "task_lifecycle",
+            action_route: "/dashboard/worker-submissions"
+          });
         }
 
         if (action === "approved") {
@@ -900,7 +987,7 @@ async function run() {
             { $inc: { coins: -submission.payable_amount } },
           );
 
-          // Credit coins to the worker
+          // credit coins to the worker
           await usersCollection.updateOne(
             { email: submission.worker.email },
             { $inc: { coins: submission.payable_amount } },
@@ -916,6 +1003,15 @@ async function run() {
             status: "completed",
             timestamp: new Date(),
           });
+
+          // notify worker's payout
+          await dispatchNotification({
+            to_email: submission.worker.email,
+            title: "Task Approved! Payout Sent",
+            message: `Excellent work! Your submission for "${submission.task_title}" was approved. ${submission.payable_amount} coins have been added to your vault.`,
+            type: "payout",
+            action_route: "/dashboard/worker-home"
+          });
         }
 
         if (action === "request_revision") {
@@ -923,7 +1019,15 @@ async function run() {
             { _id: new ObjectId(id) },
             { $set: { status: "revision_requested", reviewedAt: new Date() } }
           );
-          // Do NOT deduct buyer coins, do NOT pay worker, do NOT refund slot
+          // notify worker's submission revisions
+          await dispatchNotification({
+            to_email: submission.worker.email,
+            title: "Revision Requested",
+            message: `The buyer requested changes on your work for "${submission.task_title}". Notes: ${feedback || "Please review submission guidelines."}`,
+            type: "task_lifecycle",
+            action_route: "/dashboard/worker-submissions"
+          });
+          
           return res.send({ success: true, message: "Revision requested" });
         }
 
@@ -934,7 +1038,7 @@ async function run() {
       }
     });
 
-    //get worker stats
+    // Get worker's stats
     app.get("/worker-stats/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
       if (req.user.email !== email) {
@@ -952,7 +1056,7 @@ async function run() {
                 totalPendingSubmissions: {
                   $sum: { $cond: [{ $eq: ["$status", ["pending", "revision_requested"]] }, 1, 0] },
                 },
-                // Sum payable_amount ONLY for approved tasks
+                // sum payable_amount ONLY for approved tasks
                 totalEarnings: {
                   $sum: {
                     $cond: [
@@ -998,11 +1102,11 @@ async function run() {
       }
     });
 
-    //get buyer stats
+    // Get buyer stats
     app.get("/buyer-stats/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
 
-      //check user is request their own stats
+      // check user is request their own stats
       if (req.user.email !== email) {
         return res.status(403).send({ message: "Forbidden Access" });
       }
@@ -1064,12 +1168,12 @@ async function run() {
       }
     });
 
-    //get admin stats
+    // Get admin stats
     app.get("/admin-stats", verifyToken, async (req, res) => {
       const COIN_TO_DOLLAR_RATE = parseInt(process.env.COIN_TO_DOLLAR_RATE);
       try {
         const [userStats, paymentStats] = await Promise.all([
-          // From users collection: count workers, buyers, sum all coins
+          // from users collection --> count workers, buyers, sum all coins
           usersCollection
             .aggregate([
               {
@@ -1095,7 +1199,7 @@ async function run() {
             ])
             .toArray(),
 
-          // From submitted_tasks: sum payable_amount where approved
+          // from submitted_tasks --> sum payable_amount where approved
           submittedTasksCollection
             .aggregate([
               { $match: { status: "approved" } },
@@ -1133,12 +1237,12 @@ async function run() {
       }
     });
 
-    //withdraw coin request
+    // Withdraw coin request
     app.post("/withdrawals", verifyToken, async (req, res) => {
       const withdrawalData = req.body;
       const workerEmail = req.user.email;
 
-      // Use a session for atomicity (Highly Recommended for financial ops)
+      // use session for atomicity
       const session = client.startSession();
 
       try {
@@ -1154,7 +1258,7 @@ async function run() {
           account_number,
         } = withdrawalData;
 
-        // Validation
+        // validation
         if (
           !worker_name ||
           !withdrawal_coin ||
@@ -1167,7 +1271,6 @@ async function run() {
         const requestedCoins = Number(withdrawal_coin);
         const calculatedUSD = requestedCoins / WITHDRAW_COIN_TO_DOLLAR_RATE;
 
-        // Check against .env Minimum
         if (requestedCoins < MIN_WITHDRAW_COINS) {
           return res.status(400).send({
             message: `Minimum withdrawal is ${MIN_WITHDRAW_COINS} coins.`,
@@ -1195,19 +1298,19 @@ async function run() {
             status: "pending",
           };
 
-          // 1. Create Withdrawal Record
+          // create withdrawal record
           const result = await withdrawalsCollection.insertOne(withdrawalDoc, {
             session,
           });
 
-          // 2. Deduct Coins from User
+          // deduct coins from user
           await usersCollection.updateOne(
             { email: workerEmail },
             { $inc: { coins: -requestedCoins } },
             { session },
           );
 
-          // 3. Create Transaction Ledger
+          // create transaction ledger
           await transactionsCollection.insertOne(
             {
               receiver_email: workerEmail,
@@ -1223,6 +1326,15 @@ async function run() {
           );
         });
 
+        // notification for withdrawal request
+       await dispatchNotification({
+          to_email: workerEmail,
+          title: "Withdrawal Requested",
+          message: `Your request to withdraw ${requestedCoins} coins ($${calculatedUSD.toFixed(2)}) is submitted and pending admin review.`,
+          type: "financial",
+          action_route: "/dashboard/worker-withdrawals"
+        }, session); // passing session ensures it rolls back if the database transaction fails
+      
         res.status(201).send({
           success: true,
           message: "Withdrawal request submitted successfully",
@@ -1241,7 +1353,7 @@ async function run() {
       }
     });
 
-    //get all pending withdrawals for admin
+    // Get all pending withdrawals for admin
     app.get("/admin/withdrawals", verifyToken, async (req, res) => {
       const result = await withdrawalsCollection
         .find({ status: "pending" })
@@ -1249,7 +1361,7 @@ async function run() {
       res.send(result);
     });
 
-    // withdrawal approval route for admin
+    // Withdrawal approval route for admin
     app.patch("/admin/withdraw-process/:id", verifyToken, async (req, res) => {
       const id = req.params.id;
       const { action } = req.body; // 'approve' or 'reject'
@@ -1260,7 +1372,7 @@ async function run() {
         if (!request)
           return res.status(404).send({ message: "Request not found" });
 
-        // Safeguard: Don't process something already finished
+        // ignore if status is pending
         if (request.status !== "pending") {
           return res
             .status(400)
@@ -1268,15 +1380,23 @@ async function run() {
         }
 
         if (action === "approve") {
-          // 1. Update Withdrawal Status
+          // update withdrawal status
           await withdrawalsCollection.updateOne(filter, {
             $set: { status: "approved" },
           });
-          // 2. Mark Transaction as Completed
+          // mark transaction as completed
           await transactionsCollection.updateOne(
             { withdrawal_id: new ObjectId(id) },
             { $set: { status: "completed" } },
           );
+          // dispatch success notification
+          await dispatchNotification({
+            to_email: request.worker_email,
+            title: "Withdrawal Request Paid Out!",
+            message: `Your financial withdrawal request for ${request.withdrawal_coin} coins ($${request.withdrawal_amount.toFixed(2)}) via ${request.payment_system} has been approved and dispatched.`,
+            type: "withdrawal",
+            action_route: "/dashboard/worker-home"
+          });
           return res.send({
             success: true,
             message: "Withdrawal Approved & Paid",
@@ -1284,20 +1404,31 @@ async function run() {
         }
 
         if (action === "reject") {
-          // 1. Update Withdrawal Status
+          // update withdrawal status
           await withdrawalsCollection.updateOne(filter, {
             $set: { status: "rejected" },
           });
-          // 2. Refund Coins (CRITICAL STEP)
+
+          // refund coins
           await usersCollection.updateOne(
             { email: request.worker_email },
             { $inc: { coins: request.withdrawal_coin } },
           );
-          // 3. Mark Transaction as Rejected
+
+          // update status as rejected on transaction
           await transactionsCollection.updateOne(
             { withdrawal_id: new ObjectId(id) },
             { $set: { status: "rejected" } },
           );
+
+          // dispatch refund notification
+          await dispatchNotification({
+            to_email: request.worker_email,
+            title: "Withdrawal Request Declined",
+            message: `Your withdrawal request for ${request.withdrawal_coin} coins was rejected. The entire balance has been safely refunded to your account profile.`,
+            type: "withdrawal",
+            action_route: "/dashboard/worker-home"
+          });
           return res.send({
             success: true,
             message: "Withdrawal Rejected & Coins Refunded",
@@ -1312,10 +1443,10 @@ async function run() {
       }
     });
 
-    // fetch all coin purchase package options
+    // Fetch all coin purchase package options
     app.get("/packages", verifyToken, async (req, res) => {
       try {
-        // We use .find() to get all packages and sort them by coin amount (ascending)
+        //.find() to get all packages and sort them by coin amount (ascending)
         const result = await packagesCollection
           .find()
           .sort({ coins: 1 })
@@ -1367,7 +1498,7 @@ async function run() {
 
         const stats = statsArray[0] || { dailyTotal: 0, monthlyTotal: 0 };
 
-        // Calculate time until the next local midnight
+        // calculate time until the next local midnight
         const nextReset = userNow.plus({ days: 1 }).startOf("day");
         const timeLeft = nextReset
           .diff(userNow, ["hours", "minutes"])
@@ -1397,7 +1528,7 @@ async function run() {
       }
     });
 
-    // process coin purchase with daily and monthly limit
+    // Process coin purchase with daily and monthly limit
     app.post("/purchase-coins", verifyToken, async (req, res) => {
       const { packageId } = req.body;
       const userEmail = req.user.email;
@@ -1407,7 +1538,7 @@ async function run() {
       }
 
       try {
-        // Fetch User and Package in parallel
+        // fetch User and Package in parallel
         const [user, pkg] = await Promise.all([
           usersCollection.findOne({ email: userEmail }),
           packagesCollection.findOne({ _id: new ObjectId(packageId) }),
@@ -1417,15 +1548,15 @@ async function run() {
           return res.status(404).send({ message: "User or Package not found" });
         }
 
-        // Luxon for calculate time boundaries based on user's timezone
+        // luxon for calculate time boundaries based on user's timezone
         const userTimezone = user.timezone;
         const userNow = DateTime.now().setZone(userTimezone);
 
-        // Get Start of Day and Start of Month as UTC Date objects for MongoDB
+        // get start of day and start of month as UTC date objects for db
         const startOfDay = userNow.startOf("day").toJSDate();
         const startOfMonth = userNow.startOf("month").toJSDate();
 
-        // Aggregate current usage from the start of the month
+        // aggregate current usage from the start of the month
         const usageArray = await transactionsCollection
           .aggregate([
             {
@@ -1451,14 +1582,13 @@ async function run() {
 
         const { daily = 0, monthly = 0 } = usageArray[0] || {};
 
-        // Limit Guard Clauses
-        //daily limit
+        // check daily limit
         if (daily + pkg.coins > DAILY_COIN_LIMIT) {
           return res.status(429).send({
             message: `Daily limit of ${DAILY_COIN_LIMIT} coins exceeded.`,
           });
         }
-        //monthly limit
+        // check monthly limit
         if (monthly + pkg.coins > MONTHLY_COIN_LIMIT) {
           return res.status(429).send({
             message: `Monthly limit of ${MONTHLY_COIN_LIMIT} coins exceeded.`,
@@ -1475,7 +1605,6 @@ async function run() {
           timestamp: new Date(),
         };
 
-        // We use Promise.all to run these updates concurrently for speed
         await Promise.all([
           purchasesCollection.insertOne({
             ...transactionDoc,
@@ -1486,6 +1615,13 @@ async function run() {
             { email: userEmail },
             { $inc: { coins: pkg.coins } }, // $inc is atomic on a single document
           ),
+          dispatchNotification({
+            to_email: userEmail,
+            title: "Coins Purchased Successfully!",
+            message: `Success! You bought the "${pkg.name}" package. ${pkg.coins} coins have been added to your balance.`,
+            type: "financial",
+            action_route: "/dashboard/buyer-home"
+          })
         ]);
 
         res.status(201).send({
@@ -1499,7 +1635,7 @@ async function run() {
       }
     });
 
-    //Fetches all approved payouts made by a specific buyer to workers
+    // Fetches all approved payouts made by a specific buyer to workers
     app.get("/buyer-payments/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
 
@@ -1508,7 +1644,7 @@ async function run() {
           return res.status(403).send({ message: "Forbidden Access" });
         }
 
-        // Query for approved submissions linked to this buyer
+        // query for approved submissions linked to this buyer
         const result = await submittedTasksCollection
           .find({
             "buyer.email": email,
@@ -1521,6 +1657,60 @@ async function run() {
       } catch (error) {
         console.error("Error fetching buyer payment history:", error);
         res.status(500).send({ message: "Failed to fetch payment history" });
+      }
+    });
+
+
+    // get a user's notification timeline (Newest first)
+    app.get("/notifications/:email", verifyToken, async (req, res) => {
+      const email = req.params.email;
+      if (req.user.email !== email) return res.status(403).send({ message: "Forbidden Access" });
+
+      try {
+        const alerts = await notificationsCollection
+          .find({ to_email: email })
+          .sort({ timestamp: -1 })
+          .limit(50) // Caps database cursor payload size
+          .toArray();
+        res.send(alerts);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to load notifications" });
+      }
+    });
+
+
+    // Atomic single read flag state mutation
+    app.patch("/notifications/read-single/:id", verifyToken, async (req, res) => {
+      const id = req.params.id;
+      try {
+        const target = await notificationsCollection.findOne({ _id: new ObjectId(id) });
+        if (!target) return res.status(404).send({ message: "Notification missing" });
+        if (target.to_email !== req.user.email) return res.status(403).send({ message: "Forbidden" });
+
+        await notificationsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { isRead: true } }
+        );
+        res.send({ success: true });
+      } catch (error) {
+        res.status(500).send({ message: "Server error flagging event read status" });
+      }
+    });
+
+
+    // Bulk read flag state mutation
+    app.patch("/notifications/:email/read-all", verifyToken, async (req, res) => {
+      const email = req.params.email;
+      if (req.user.email !== email) return res.status(403).send({ message: "Forbidden Access" });
+
+      try {
+        await notificationsCollection.updateMany(
+          { to_email: email, isRead: false },
+          { $set: { isRead: true } }
+        );
+        res.send({ success: true });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to mark updates read" });
       }
     });
 
