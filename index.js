@@ -600,8 +600,7 @@ async function run() {
     app.post("/tasks", verifyToken, async (req, res) => {
       const task = req.body;
       const buyerEmail = req.user.email;
-      const totalPayable =
-        Number(task.required_workers) * Number(task.payable_amount);
+      const totalPayable = Number(task.required_workers) * Number(task.payable_amount);
 
       try {
         const user = await usersCollection.findOne({ email: buyerEmail });
