@@ -43,12 +43,17 @@ const client = new MongoClient(uri, {
   },
 });
 
-// --- COOKIE OPTIONS ---
-const cookieOptions = {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === "production",
-  sameSite: process.env.NODE_ENV === "production" ? "none" : "strict",
-  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+// --- COOKIE OPTIONS function ---
+const getCookieOptions = (req) => {
+  // check if the request comes from localhost or Vercel production
+  const isLocal = req.get("origin")?.includes("localhost") || req.get("host")?.includes("localhost");
+
+  return {
+    httpOnly: true,
+    secure: !isLocal, // true on Vercel (HTTPS), false on localhost (HTTP)
+    sameSite: isLocal ? "strict" : "none", // "none" allows cross-site cookies across Vercel apps
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  };
 };
 
 async function run() {
@@ -62,17 +67,19 @@ async function run() {
         expiresIn: "7d",
       });
 
-      res.cookie("token", token, cookieOptions).send({ success: true });
+      // pass req to getCookieOptions to dynamically calculate properties
+      res.cookie("token", token, getCookieOptions(req)).send({ success: true });
     });
 
     // Logout
     app.post("/logout", (req, res) => {
+      const options = getCookieOptions(req);
+      
+      // maxAge isn't required for clearCookie
+      delete options.maxAge; 
+
       res
-        .clearCookie("token", {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === "production",
-          sameSite: process.env.NODE_ENV === "production" ? "none" : "strict",
-        })
+        .clearCookie("token", options)
         .send({ success: true });
     });
 
