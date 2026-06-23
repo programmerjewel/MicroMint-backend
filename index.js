@@ -884,10 +884,14 @@ async function run() {
 
         // add on notifications after update task
         if (payable_amount || task_detail || submission_info) {
-          const affectedWorkers = await submittedTasksCollection.distinct(
-            "worker.email",
-            { task_id: id },
-          );
+          const affectedWorkersDocs = await submittedTasksCollection.aggregate([
+            { $match: { task_id: id } },
+            { $group: { _id: "$worker.email" } }
+          ]).toArray();
+
+          // Map the aggregated documents down into an array of email strings
+          const affectedWorkers = affectedWorkersDocs.map(doc => doc._id);
+
           for (const workerEmail of affectedWorkers) {
             await dispatchNotification({
               to_email: workerEmail,
@@ -1943,6 +1947,90 @@ async function run() {
       }
     });
 
+    // A completely public route open to anyone viewing the homepage
+    app.get("/public-stats", async (req, res) => {
+      try {
+        const [userStats, paymentStats] = await Promise.all([
+          usersCollection
+            .aggregate([
+              {
+                $group: {
+                  _id: null,
+                  totalWorkers: {
+                    $sum: { $cond: [{ $eq: ["$role", "worker"] }, 1, 0] },
+                  },
+                  totalBuyers: {
+                    $sum: { $cond: [{ $eq: ["$role", "buyer"] }, 1, 0] },
+                  },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  totalWorkers: 1,
+                  totalBuyers: 1,
+                },
+              },
+            ])
+            .toArray(),
+
+          submittedTasksCollection
+            .aggregate([
+              { $match: { status: "approved" } },
+              {
+                $group: {
+                  _id: null,
+                  totalApprovedCoins: { $sum: "$payable_amount" },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  totalPaymentsCoins: "$totalApprovedCoins",
+                },
+              },
+            ])
+            .toArray(),
+        ]);
+
+        res.send({
+          totalWorkers: userStats[0]?.totalWorkers ?? 0,
+          totalBuyers: userStats[0]?.totalBuyers ?? 0,
+          totalPaymentsUSD: Math.round(((paymentStats[0]?.totalPaymentsCoins ?? 0) / COIN_TO_DOLLAR_RATE) * 100) / 100,
+        });
+      } catch (error) {
+        console.error("Public stats error:", error);
+        res.status(500).send({ message: "Failed to fetch platform stats" });
+      }
+    });
+
+
+    // Get 3 latest active tasks for the public homepage "Browse Live Tasks" section
+    app.get("/homepage-live-tasks", async (req, res) => {
+      try {
+        const result = await taskCollection
+          .find({ 
+            status: "open", 
+            required_workers: { $gt: 0 } // Only fetch tasks that still have slots open
+          })
+          .sort({ createdAt: -1 }) // Sort by lastly added
+          .limit(3) // Fetch exactly 3 task cards
+          .project({
+            // Project only what's required to optimize network payload
+            task_title: 1,
+            payable_amount: 1,
+            required_workers: 1,
+            "buyer.name": 1,
+            _id: 1
+          })
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        console.error("Error fetching homepage live tasks:", error);
+        res.status(500).send({ message: "Failed to fetch live tasks data" });
+      }
+    });
 
     console.log("Connected to MongoDB!");
   } finally {
